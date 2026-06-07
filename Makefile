@@ -1,20 +1,13 @@
-CC ?= gcc
-CFLAGS ?= -std=c11 -Wall -Wextra -pedantic -O2
-LDFLAGS ?=
-LDLIBS ?= -lncurses
+.PHONY: all procview testforge clean
 
-TARGET := procview
-SRC := procview.c
+all: procview testforge
 
-.PHONY: all clean run
+procview:
+	$(MAKE) -C procview
 
-all: $(TARGET)
-
-$(TARGET): $(SRC)
-	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $< $(LDLIBS)
-
-run: $(TARGET)
-	./$(TARGET)
+testforge:
+	$(MAKE) -C testforge
 
 clean:
-	rm -f $(TARGET)
+	$(MAKE) -C procview clean
+	$(MAKE) -C testforge clean

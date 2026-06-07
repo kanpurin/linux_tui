@@ -1,3 +1,6 @@
 __pycache__/
 *.py[cod]
-procview
+procview/procview
+testforge/testforge
+testforge/testforge-exports/
+testforge/testforge-scenarios/
