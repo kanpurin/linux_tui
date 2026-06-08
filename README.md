@@ -26,3 +26,10 @@ make -C testforge
 ./procview/procview
 ./testforge/testforge
 ```
+
+## AutoTest Script Builder
+
+```bash
+make -C autotest-assist-tui
+./autotest-assist-tui/autotest-builder
+```
