@@ -1,5 +1,45 @@
 # AutoTest Script Builder TUI
 
+## Reboot and Rescue Limitations
+
+Reboot tests can run while systemd is still moving between targets. In that
+window, some commands do not yet have reliable state even when the machine
+itself is working correctly.
+
+Known fragile commands:
+
+- `runlevel` and `who -r`: they read utmp. During early resume or
+  rescue-to-default transition, utmp may still be empty, stale, or `unknown`.
+- `systemctl is-active rescue.target`: the resume service can run before
+  `rescue.service`, so rescue may not be `active` yet.
+- `systemctl is-system-running`: target transitions may report `starting`,
+  `maintenance`, or `degraded` temporarily.
+- Login/session commands such as `who`, `w`, and `users`: these also depend on
+  utmp/session state.
+- Network state commands such as `hostname -I`, `ip route`, or `nmcli`: early
+  resume may run before the network is fully ready.
+
+For test assertions, prefer assigning a purpose-built variable from stable
+checks, then match that variable:
+
+```sh
+target=$(systemctl get-default)
+case "$target" in
+  multi-user.target|runlevel2.target|runlevel3.target|runlevel4.target)
+    AUTOTEST_ACTUAL=3
+    ;;
+  rescue.target|runlevel1.target)
+    AUTOTEST_ACTUAL=1
+    ;;
+  *)
+    AUTOTEST_ACTUAL=unknown
+    ;;
+esac
+```
+
+Use `runlevel` only after the system has completed the transition and utmp has
+been updated.
+
 Linux 向けの「自動テスト作成支援」TUI です。`Create test` から独自エディタを開いてテストを作成し、作成済みテストを複数選択して自動テストを開始できます。
 
 生成されるテストスクリプトは、各テスト項目を実行し、終了コードと出力判定から結果を `OK` または `NG` として表示します。

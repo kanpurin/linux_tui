@@ -15,7 +15,8 @@
 #define PREVIEW_LINES 512
 #define EDITOR_LINES 160
 #define EDITOR_COLS 256
-#define REGISTRY_LINE (LONG_LEN * 2)
+#define REGISTRY_LINE (LONG_LEN * 4)
+#define EDITOR_TAB_WIDTH 4
 
 typedef enum {
     SCREEN_DASHBOARD,
@@ -45,6 +46,11 @@ typedef enum {
     CMD_VIM
 } CommandKind;
 
+typedef enum {
+    EDIT_TARGET_COMMAND,
+    EDIT_TARGET_CHECK_EXPECTED
+} EditorTarget;
+
 typedef struct {
     char id[32];
     char title[TEXT_LEN];
@@ -53,10 +59,9 @@ typedef struct {
     CommandKind kind;
     bool selected;
     int expected_exit;
-    MatchType stdout_match;
-    char stdout_expected[TEXT_LEN];
-    MatchType stderr_match;
-    char stderr_expected[TEXT_LEN];
+    char check_var[TEXT_LEN];
+    MatchType check_match;
+    char check_expected[LONG_LEN];
     char cleanup[LONG_LEN];
     int timeout_sec;
     bool requires_root;
@@ -88,6 +93,8 @@ typedef struct {
     bool editor_insert;
     bool editor_command_mode;
     bool editor_new_case;
+    bool regex_template_list_open;
+    EditorTarget editor_target;
     char editor_command[64];
     int editor_command_len;
     char status[TEXT_LEN];
@@ -95,6 +102,29 @@ typedef struct {
     int preview_count;
     int preview_scroll;
 } App;
+
+typedef struct {
+    const char *label;
+    const char *text;
+} RegexTemplate;
+
+static const RegexTemplate REGEX_TEMPLATES[] = {
+    {"digits", "[[:digit:]]+"},
+    {"alpha", "[[:alpha:]]+"},
+    {"alnum", "[[:alnum:]]+"},
+    {"space", "[[:space:]]+"},
+    {"word", "[[:alnum:]_]+"},
+    {"any", ".*"},
+    {"optional", "?"},
+    {"repeat", "*"},
+    {"one_plus", "+"},
+    {"count", "{1,3}"},
+    {"group", "()"},
+    {"line_start", "^"},
+    {"line_end", "$"}
+};
+
+#define REGEX_TEMPLATE_COUNT ((int)(sizeof(REGEX_TEMPLATES) / sizeof(REGEX_TEMPLATES[0])))
 
 static void write_match_function(FILE *f);
 static void write_case(FILE *f, const TestCase *tc, int index);
@@ -181,6 +211,66 @@ static void copy_text(char *dst, size_t dst_sz, const char *src) {
     dst[len] = '\0';
 }
 
+static void summarize_multiline(char *dst, size_t dst_sz, const char *src) {
+    size_t j = 0;
+    if (dst_sz == 0) return;
+    for (size_t i = 0; src && src[i] && j + 2 < dst_sz; i++) {
+        if (src[i] == '\n') {
+            dst[j++] = '\\';
+            dst[j++] = 'n';
+        } else if (src[i] == '\t') {
+            dst[j++] = '\\';
+            dst[j++] = 't';
+        } else {
+            dst[j++] = src[i];
+        }
+    }
+    dst[j] = '\0';
+}
+
+static int editor_visual_col(const char *line, int col) {
+    int visual = 0;
+    for (int i = 0; line && line[i] && i < col; i++) {
+        visual += line[i] == '\t' ? EDITOR_TAB_WIDTH : 1;
+    }
+    return visual;
+}
+
+static void print_editor_line(int y, int x, int w, const char *line) {
+    int cx = x;
+    for (int i = 0; line && line[i] && cx < x + w; i++) {
+        if (line[i] == '\t') {
+            for (int n = 0; n < EDITOR_TAB_WIDTH && cx < x + w; n++) {
+                mvaddch(y, cx++, ' ');
+            }
+        } else {
+            mvaddch(y, cx++, line[i]);
+        }
+    }
+    while (cx < x + w) {
+        mvaddch(y, cx++, ' ');
+    }
+}
+
+static void draw_editor_cursor(const App *app, int y, int x, int w, const char *line) {
+    int len = (int)strlen(line);
+    int cx = x + editor_visual_col(line, app->editor_col);
+    if (cx >= x + w) return;
+    attron(A_UNDERLINE);
+    if (app->editor_col < len) {
+        if (line[app->editor_col] == '\t') {
+            for (int n = 0; n < EDITOR_TAB_WIDTH && cx + n < x + w; n++) {
+                mvaddch(y, cx + n, ' ');
+            }
+        } else {
+            mvaddch(y, cx, line[app->editor_col]);
+        }
+    } else {
+        mvaddch(y, cx, '_');
+    }
+    attroff(A_UNDERLINE);
+}
+
 static void escape_field(char *dst, size_t dst_sz, const char *src) {
     size_t j = 0;
     if (dst_sz == 0) return;
@@ -225,6 +315,13 @@ static MatchType parse_match(const char *s) {
     return MATCH_NONE;
 }
 
+static bool is_match_name(const char *s) {
+    for (int i = MATCH_NONE; i <= MATCH_NOT_EMPTY; i++) {
+        if (strcmp(s, match_name((MatchType)i)) == 0) return true;
+    }
+    return false;
+}
+
 static CommandKind parse_kind(const char *s) {
     if (strcmp(s, "reboot") == 0) return CMD_REBOOT;
     if (strcmp(s, "vim") == 0) return CMD_VIM;
@@ -264,9 +361,15 @@ static bool file_contains_reboot(const char *path) {
     return found;
 }
 
-static void load_editor_from_case(App *app) {
-    if (app->project.case_count == 0) return;
-    const char *src = app->project.cases[app->selected_case].command;
+static const char *editor_target_name(EditorTarget target) {
+    switch (target) {
+    case EDIT_TARGET_COMMAND: return "script body";
+    case EDIT_TARGET_CHECK_EXPECTED: return "variable expected";
+    }
+    return "text";
+}
+
+static void load_editor_text(App *app, const char *src) {
     app->editor_line_count = 1;
     app->editor_row = 0;
     app->editor_col = 0;
@@ -298,22 +401,45 @@ static void load_editor_from_case(App *app) {
     }
 }
 
-static void save_editor_to_case(App *app) {
-    if (app->project.case_count == 0) return;
-    TestCase *tc = &app->project.cases[app->selected_case];
+static void save_editor_text(App *app, char *dst, size_t dst_sz) {
     size_t pos = 0;
-    tc->command[0] = '\0';
+    if (dst_sz == 0) return;
+    dst[0] = '\0';
     for (int r = 0; r < app->editor_line_count; r++) {
         const char *line = app->editor_lines[r];
         size_t len = strlen(line);
-        if (pos + len + 2 >= sizeof(tc->command)) break;
-        memcpy(tc->command + pos, line, len);
+        if (pos + len + 2 >= dst_sz) break;
+        memcpy(dst + pos, line, len);
         pos += len;
-        if (r + 1 < app->editor_line_count) tc->command[pos++] = '\n';
+        if (r + 1 < app->editor_line_count) dst[pos++] = '\n';
     }
-    tc->command[pos] = '\0';
-    tc->kind = CMD_SHELL;
-    auto_configure_test(tc);
+    dst[pos] = '\0';
+}
+
+static void load_editor_from_case(App *app) {
+    if (app->project.case_count == 0) return;
+    const TestCase *tc = &app->project.cases[app->selected_case];
+    const char *src = tc->command;
+    if (app->editor_target == EDIT_TARGET_CHECK_EXPECTED) src = tc->check_expected;
+    load_editor_text(app, src);
+}
+
+static void save_editor_to_case(App *app) {
+    if (app->project.case_count == 0) return;
+    TestCase *tc = &app->project.cases[app->selected_case];
+    if (app->editor_target == EDIT_TARGET_CHECK_EXPECTED) {
+        save_editor_text(app, tc->check_expected, sizeof(tc->check_expected));
+    } else {
+        save_editor_text(app, tc->command, sizeof(tc->command));
+        tc->kind = CMD_SHELL;
+        auto_configure_test(tc);
+    }
+}
+
+static bool editor_uses_regex_templates(const App *app) {
+    if (app->project.case_count == 0) return false;
+    const TestCase *tc = &app->project.cases[app->selected_case];
+    return app->editor_target == EDIT_TARGET_CHECK_EXPECTED && tc->check_match == MATCH_REGEX;
 }
 
 static bool text_contains(const char *haystack, const char *needle) {
@@ -349,20 +475,160 @@ static bool line_is_reboot_command(const char *line, size_t len) {
            strcmp(buf, "init 6") == 0;
 }
 
+static void trim_line_copy(char *dst, size_t dst_sz, const char *line, size_t len) {
+    size_t start = 0;
+    if (dst_sz == 0) return;
+    while (start < len && isspace((unsigned char)line[start])) start++;
+    while (len > start && isspace((unsigned char)line[len - 1])) len--;
+    if (len - start >= dst_sz) len = start + dst_sz - 1;
+    memcpy(dst, line + start, len - start);
+    dst[len - start] = '\0';
+}
+
+static void shell_quote_len(FILE *f, const char *s, size_t len) {
+    fputc('\'', f);
+    for (size_t i = 0; s && i < len; i++) {
+        if (s[i] == '\'') {
+            fputs("'\\''", f);
+        } else {
+            fputc(s[i], f);
+        }
+    }
+    fputc('\'', f);
+}
+
+static bool line_starts_tui(const char *line, size_t len, char *cmd, size_t cmd_sz) {
+    char trimmed[LONG_LEN];
+    trim_line_copy(trimmed, sizeof(trimmed), line, len);
+    if (strncmp(trimmed, "@tui", 4) != 0 || (trimmed[4] && !isspace((unsigned char)trimmed[4]))) return false;
+    const char *p = trimmed + 4;
+    while (isspace((unsigned char)*p)) p++;
+    copy_text(cmd, cmd_sz, p);
+    return cmd[0] != '\0';
+}
+
+static bool line_is_tui_end(const char *line, size_t len) {
+    char trimmed[TEXT_LEN];
+    trim_line_copy(trimmed, sizeof(trimmed), line, len);
+    return strcmp(trimmed, "@end") == 0;
+}
+
+static void write_tui_instruction(FILE *f, const char *line, size_t len) {
+    char trimmed[LONG_LEN];
+    trim_line_copy(trimmed, sizeof(trimmed), line, len);
+    if (strncmp(trimmed, "send ", 5) == 0) {
+        fputs("  printf ", f);
+        shell_quote_len(f, trimmed + 5, strlen(trimmed + 5));
+        fputc('\n', f);
+    } else if (strncmp(trimmed, "send-shell ", 11) == 0) {
+        fputs("  printf '%s' ", f);
+        fputs(trimmed + 11, f);
+        fputc('\n', f);
+    } else if (strncmp(trimmed, "text ", 5) == 0) {
+        fputs("  printf ", f);
+        shell_quote_len(f, trimmed + 5, strlen(trimmed + 5));
+        fputs("\n  printf '\\n'\n", f);
+    } else if (strncmp(trimmed, "text-shell ", 11) == 0) {
+        fputs("  printf '%s\\n' ", f);
+        fputs(trimmed + 11, f);
+        fputc('\n', f);
+    } else if (strcmp(trimmed, "enter") == 0) {
+        fputs("  printf '\\r'\n", f);
+    } else if (strcmp(trimmed, "esc") == 0) {
+        fputs("  printf '\\033'\n", f);
+    } else if (strcmp(trimmed, "tab") == 0) {
+        fputs("  printf '\\t'\n", f);
+    } else if (strcmp(trimmed, "space") == 0) {
+        fputs("  printf ' '\n", f);
+    } else if (strncmp(trimmed, "sleep ", 6) == 0) {
+        fputs("  sleep ", f);
+        for (const char *p = trimmed + 6; *p; p++) {
+            if (isdigit((unsigned char)*p) || *p == '.') fputc(*p, f);
+        }
+        fputc('\n', f);
+    } else if (strncmp(trimmed, "ctrl ", 5) == 0 && trimmed[5]) {
+        unsigned char c = (unsigned char)tolower((unsigned char)trimmed[5]);
+        if (c >= 'a' && c <= 'z') {
+            fprintf(f, "  printf '\\%03o'\n", c - 'a' + 1);
+        } else {
+            fputs("  echo '[NG] invalid ctrl key in @tui block' >&2\n  exit 1\n", f);
+        }
+    } else if (trimmed[0]) {
+        fputs("  echo ", f);
+        shell_quote_len(f, "[NG] unknown command in @tui block: ", 36);
+        fputs(" >&2\n", f);
+        fputs("  echo ", f);
+        shell_quote_len(f, trimmed, strlen(trimmed));
+        fputs(" >&2\n  exit 1\n", f);
+    }
+}
+
+static void write_shell_line(FILE *f, const char *line, size_t len) {
+    fwrite(line, 1, len, f);
+    fputc('\n', f);
+}
+
+static void write_command_expanded(FILE *f, const char *command) {
+    bool in_tui = false;
+    char tui_cmd[LONG_LEN];
+    const char *p = command;
+    while (p && *p) {
+        const char *end = strchr(p, '\n');
+        size_t len = end ? (size_t)(end - p) : strlen(p);
+        if (!in_tui) {
+            if (line_starts_tui(p, len, tui_cmd, sizeof(tui_cmd))) {
+                fputs("if ! command -v script >/dev/null 2>&1; then echo '[NG] missing script command' >&2; exit 1; fi\n", f);
+                fputs("{\n", f);
+                in_tui = true;
+            } else if (line_is_tui_end(p, len)) {
+                fputs("echo '[NG] @end without @tui' >&2\nexit 1\n", f);
+            } else {
+                write_shell_line(f, p, len);
+            }
+        } else {
+            if (line_is_tui_end(p, len)) {
+                fputs("} | script -q -c ", f);
+                shell_quote_len(f, tui_cmd, strlen(tui_cmd));
+                fputs(" /dev/null >/dev/null 2>&1\n", f);
+                in_tui = false;
+            } else if (line_starts_tui(p, len, tui_cmd, sizeof(tui_cmd))) {
+                fputs("  echo '[NG] nested @tui block' >&2\n  exit 1\n", f);
+            } else {
+                write_tui_instruction(f, p, len);
+            }
+        }
+        p = end ? end + 1 : NULL;
+    }
+    if (in_tui) {
+        fputs("  echo '[NG] missing @end for @tui block' >&2\n  exit 1\n", f);
+        fputs("} | script -q -c ", f);
+        shell_quote_len(f, tui_cmd, strlen(tui_cmd));
+        fputs(" /dev/null >/dev/null 2>&1\n", f);
+    }
+}
+
 static void write_command_phase(FILE *f, const char *command, bool want_post) {
     bool after_reboot = false;
+    char phase[LONG_LEN];
+    size_t phase_pos = 0;
     const char *p = command;
+    phase[0] = '\0';
     while (p && *p) {
         const char *end = strchr(p, '\n');
         size_t len = end ? (size_t)(end - p) : strlen(p);
         if (line_is_reboot_command(p, len)) {
             after_reboot = true;
         } else if (after_reboot == want_post) {
-            fwrite(p, 1, len, f);
-            fputc('\n', f);
+            if (phase_pos + len + 2 < sizeof(phase)) {
+                memcpy(phase + phase_pos, p, len);
+                phase_pos += len;
+                phase[phase_pos++] = '\n';
+                phase[phase_pos] = '\0';
+            }
         }
         p = end ? end + 1 : NULL;
     }
+    write_command_expanded(f, phase);
 }
 
 static void write_reboot_command(FILE *f, const char *command) {
@@ -378,6 +644,20 @@ static void write_reboot_command(FILE *f, const char *command) {
         p = end ? end + 1 : NULL;
     }
     fputs("reboot\n", f);
+}
+
+static void make_safe_id(const char *id, char *out, size_t out_sz, char replacement) {
+    size_t j = 0;
+    if (out_sz == 0) return;
+    for (size_t i = 0; id && id[i] && j + 1 < out_sz; i++) {
+        unsigned char c = (unsigned char)id[i];
+        out[j++] = (char)(isalnum(c) ? tolower(c) : replacement);
+    }
+    if (j == 0) {
+        copy_text(out, out_sz, "test");
+    } else {
+        out[j] = '\0';
+    }
 }
 
 static bool cleanup_has_path(const char *cleanup, const char *path) {
@@ -435,6 +715,7 @@ static void collect_temp_paths(TestCase *tc, const char *prefix) {
 }
 
 static void auto_configure_test(TestCase *tc) {
+    if (!tc->check_var[0]) copy_text(tc->check_var, sizeof(tc->check_var), "AUTOTEST_ACTUAL");
     tc->cleanup[0] = '\0';
     collect_temp_paths(tc, "/tmp/");
     collect_temp_paths(tc, "/var/tmp/");
@@ -504,11 +785,18 @@ static int write_single_test_script(TestCase *tc) {
     return 0;
 }
 
-static void open_script_editor(App *app) {
+static void open_text_editor(App *app, EditorTarget target, Screen return_screen) {
+    app->editor_target = target;
+    app->previous_screen = return_screen;
+    app->regex_template_list_open = false;
     load_editor_from_case(app);
     app->screen = SCREEN_SCRIPT_EDITOR;
     app->selected_menu = 0;
-    set_status(app, "Script editor: i insert, Esc normal, :wq save, :q cancel.");
+    set_status(app, "Text editor: i insert, Esc normal, :wq save, :q cancel.");
+}
+
+static void open_script_editor(App *app) {
+    open_text_editor(app, EDIT_TARGET_COMMAND, SCREEN_EDITOR);
 }
 
 static void discard_current_case_if_new(App *app) {
@@ -560,25 +848,24 @@ static void save_test_registry(const Project *p) {
     if (registry_path(path, sizeof(path)) != 0) return;
     FILE *f = fopen(path, "w");
     if (!f) return;
-    fprintf(f, "# autotest-assist tests v1\n");
-    fprintf(f, "# path\ttitle\tselected\tkind\texpected_exit\tstdout_match\tstdout_expected\tstderr_match\tstderr_expected\tcommand\n");
+    fprintf(f, "# autotest-assist tests v2\n");
+    fprintf(f, "# path\ttitle\tselected\tkind\texpected_exit\tcheck_var\tcheck_match\tcheck_expected\tcommand\n");
     for (int i = 0; i < p->case_count; i++) {
         const TestCase *tc = &p->cases[i];
         if (!tc->script_path[0]) continue;
-        char fields[10][LONG_LEN];
+        char fields[9][LONG_LEN];
         escape_field(fields[0], sizeof(fields[0]), tc->script_path);
         escape_field(fields[1], sizeof(fields[1]), tc->title);
         snprintf(fields[2], sizeof(fields[2]), "%d", tc->selected ? 1 : 0);
         escape_field(fields[3], sizeof(fields[3]), command_kind_name(tc->kind));
         snprintf(fields[4], sizeof(fields[4]), "%d", tc->expected_exit);
-        escape_field(fields[5], sizeof(fields[5]), match_name(tc->stdout_match));
-        escape_field(fields[6], sizeof(fields[6]), tc->stdout_expected);
-        escape_field(fields[7], sizeof(fields[7]), match_name(tc->stderr_match));
-        escape_field(fields[8], sizeof(fields[8]), tc->stderr_expected);
-        escape_field(fields[9], sizeof(fields[9]), tc->command);
-        fprintf(f, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+        escape_field(fields[5], sizeof(fields[5]), tc->check_var);
+        escape_field(fields[6], sizeof(fields[6]), match_name(tc->check_match));
+        escape_field(fields[7], sizeof(fields[7]), tc->check_expected);
+        escape_field(fields[8], sizeof(fields[8]), tc->command);
+        fprintf(f, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
                 fields[0], fields[1], fields[2], fields[3], fields[4],
-                fields[5], fields[6], fields[7], fields[8], fields[9]);
+                fields[5], fields[6], fields[7], fields[8]);
     }
     fclose(f);
 }
@@ -614,11 +901,19 @@ static bool load_test_registry(Project *p) {
         tc->selected = field_count > 2 ? atoi(fields[2]) != 0 : false;
         tc->kind = field_count > 3 ? parse_kind(fields[3]) : CMD_SHELL;
         tc->expected_exit = field_count > 4 ? atoi(fields[4]) : 0;
-        tc->stdout_match = field_count > 5 ? parse_match(fields[5]) : MATCH_NONE;
-        if (field_count > 6) unescape_field(tc->stdout_expected, sizeof(tc->stdout_expected), fields[6]);
-        tc->stderr_match = field_count > 7 ? parse_match(fields[7]) : MATCH_EMPTY;
-        if (field_count > 8) unescape_field(tc->stderr_expected, sizeof(tc->stderr_expected), fields[8]);
-        if (field_count > 9) unescape_field(tc->command, sizeof(tc->command), fields[9]);
+        copy_text(tc->check_var, sizeof(tc->check_var), "AUTOTEST_ACTUAL");
+        tc->check_match = MATCH_NONE;
+        if (field_count > 7 && is_match_name(fields[5]) && is_match_name(fields[7])) {
+            tc->check_match = parse_match(fields[5]);
+            if (field_count > 6) unescape_field(tc->check_expected, sizeof(tc->check_expected), fields[6]);
+            if (field_count > 9) unescape_field(tc->command, sizeof(tc->command), fields[9]);
+        } else {
+            if (field_count > 5) unescape_field(tc->check_var, sizeof(tc->check_var), fields[5]);
+            if (!tc->check_var[0]) copy_text(tc->check_var, sizeof(tc->check_var), "AUTOTEST_ACTUAL");
+            tc->check_match = field_count > 6 ? parse_match(fields[6]) : MATCH_NONE;
+            if (field_count > 7) unescape_field(tc->check_expected, sizeof(tc->check_expected), fields[7]);
+            if (field_count > 8) unescape_field(tc->command, sizeof(tc->command), fields[8]);
+        }
         tc->timeout_sec = 30;
         if (!tc->title[0]) copy_text(tc->title, sizeof(tc->title), tc->script_path);
         if (tc->kind != CMD_REBOOT && file_contains_reboot(tc->script_path)) tc->kind = CMD_REBOOT;
@@ -730,12 +1025,14 @@ static void draw_case_details(const App *app, int y, int x, int h, int w) {
     draw_box(y, x, h, w, "Details");
     if (app->project.case_count == 0) return;
     const TestCase *tc = &app->project.cases[app->selected_case];
+    char check_summary[LONG_LEN];
+    summarize_multiline(check_summary, sizeof(check_summary), tc->check_expected);
     mvprintw(y + 1, x + 1, "id: %s", tc->id);
     mvprintw(y + 2, x + 1, "title: %.*s", w - 9, tc->title);
     mvprintw(y + 3, x + 1, "kind: %s  selected: %s", command_kind_name(tc->kind), tc->selected ? "yes" : "no");
     mvprintw(y + 4, x + 1, "expected_exit: %d", tc->expected_exit);
-    mvprintw(y + 5, x + 1, "stdout: %s %.*s", match_name(tc->stdout_match), w - 18, tc->stdout_expected);
-    mvprintw(y + 6, x + 1, "stderr: %s %.*s", match_name(tc->stderr_match), w - 18, tc->stderr_expected);
+    mvprintw(y + 5, x + 1, "check_var: %.*s", w - 13, tc->check_var);
+    mvprintw(y + 6, x + 1, "check: %s %.*s", match_name(tc->check_match), w - 16, check_summary);
     mvprintw(y + 7, x + 1, "cleanup: auto %s", tc->cleanup[0] ? "generated" : "none");
     mvprintw(y + 8, x + 1, "reboot: auto %s", tc->kind == CMD_REBOOT ? "detected" : "none");
     mvprintw(y + 9, x + 1, "path: %.*s", w - 8, tc->script_path[0] ? tc->script_path : "<not saved>");
@@ -774,7 +1071,7 @@ static void draw_editor(const App *app, int height, int width) {
     if (has_reboot(&app->project)) {
         mvprintw(bottom + 2, 1, "selected reboot tests may interrupt sequential execution");
     }
-    static const char *menu[] = {"Edit test", "Select test", "Delete test", "Output match", "Preview selected", "Start selected tests", "Back"};
+    static const char *menu[] = {"Edit test", "Select test", "Delete test", "Variable match", "Preview selected", "Start selected tests", "Back"};
     draw_menu(height - 4, 1, width - 2, menu, 7, app->selected_menu);
 }
 
@@ -783,49 +1080,50 @@ static void draw_form(const App *app, int height, int width) {
     draw_box(3, 0, height - 7, width, "Edit Test Case");
     if (app->project.case_count == 0) return;
     const TestCase *tc = &app->project.cases[app->selected_case];
-    const char *labels[] = {"id", "title", "selected", "kind", "command", "expected_exit", "stdout_match", "stdout_expected", "stderr_match", "stderr_expected", "cleanup", "timeout_sec", "requires_root", "script_path"};
-    char values[14][LONG_LEN];
+    const char *labels[] = {"id", "title", "selected", "kind", "command", "expected_exit", "check_var", "check_match", "check_expected", "cleanup", "timeout_sec", "requires_root", "script_path"};
+    char values[13][LONG_LEN];
     snprintf(values[0], sizeof(values[0]), "%s", tc->id);
     snprintf(values[1], sizeof(values[1]), "%s", tc->title);
     snprintf(values[2], sizeof(values[2]), "%s", tc->selected ? "yes" : "no");
     snprintf(values[3], sizeof(values[3]), "%s", command_kind_name(tc->kind));
     snprintf(values[4], sizeof(values[4]), "%s", tc->command);
     snprintf(values[5], sizeof(values[5]), "%d", tc->expected_exit);
-    snprintf(values[6], sizeof(values[6]), "%s", match_name(tc->stdout_match));
-    snprintf(values[7], sizeof(values[7]), "%s", tc->stdout_expected);
-    snprintf(values[8], sizeof(values[8]), "%s", match_name(tc->stderr_match));
-    snprintf(values[9], sizeof(values[9]), "%s", tc->stderr_expected);
-    snprintf(values[10], sizeof(values[10]), "%s", tc->cleanup);
-    snprintf(values[11], sizeof(values[11]), "%d", tc->timeout_sec);
-    snprintf(values[12], sizeof(values[12]), "%s", tc->requires_root ? "yes" : "no");
-    snprintf(values[13], sizeof(values[13]), "%s", tc->script_path[0] ? tc->script_path : "<not saved>");
-    for (int i = 0; i < 14; i++) {
+    snprintf(values[6], sizeof(values[6]), "%s", tc->check_var);
+    snprintf(values[7], sizeof(values[7]), "%s", match_name(tc->check_match));
+    summarize_multiline(values[8], sizeof(values[8]), tc->check_expected);
+    snprintf(values[9], sizeof(values[9]), "%s", tc->cleanup);
+    snprintf(values[10], sizeof(values[10]), "%d", tc->timeout_sec);
+    snprintf(values[11], sizeof(values[11]), "%s", tc->requires_root ? "yes" : "no");
+    snprintf(values[12], sizeof(values[12]), "%s", tc->script_path[0] ? tc->script_path : "<not saved>");
+    for (int i = 0; i < 13; i++) {
         if (i == app->selected_field) attron(A_REVERSE);
         mvprintw(4 + i, 2, "%-16s", labels[i]);
         print_clip(4 + i, 20, width - 23, values[i]);
         if (i == app->selected_field) attroff(A_REVERSE);
     }
-    mvprintw(height - 9, 2, "Result rule: OK when expected_exit and configured output checks pass.");
+    mvprintw(height - 9, 2, "Result rule: OK when expected_exit and configured variable check pass.");
     static const char *menu[] = {"Edit value", "Change option", "Insert shell", "Insert reboot", "Insert vim", "Save test", "Cancel"};
     draw_menu(height - 4, 1, width - 2, menu, 7, app->selected_menu);
 }
 
 static void draw_match(const App *app, int height, int width) {
     draw_header(app, width);
-    draw_box(3, 0, height - 7, width, "Output Match Builder");
+    draw_box(3, 0, height - 7, width, "Variable Match Builder");
     if (app->project.case_count == 0) return;
     const TestCase *tc = &app->project.cases[app->selected_case];
-    mvprintw(5, 2, "stdout match: %-10s expected: %.*s", match_name(tc->stdout_match), width - 39, tc->stdout_expected);
-    mvprintw(6, 2, "stderr match: %-10s expected: %.*s", match_name(tc->stderr_match), width - 39, tc->stderr_expected);
+    char check_summary[LONG_LEN];
+    summarize_multiline(check_summary, sizeof(check_summary), tc->check_expected);
+    mvprintw(5, 2, "variable: %.*s", width - 12, tc->check_var);
+    mvprintw(6, 2, "match: %-10s expected: %.*s", match_name(tc->check_match), width - 31, check_summary);
     mvprintw(8, 2, "Match types:");
-    mvprintw(9, 4, "none       no output check");
+    mvprintw(9, 4, "none       no variable check");
     mvprintw(10, 4, "exact      output must be identical");
     mvprintw(11, 4, "contains   output must contain expected text");
     mvprintw(12, 4, "regex      output must match expected regular expression");
     mvprintw(13, 4, "empty      output must be empty");
     mvprintw(14, 4, "not_empty  output must not be empty");
-    static const char *menu[] = {"Set stdout match", "Set stdout expected", "Set stderr match", "Set stderr expected", "Back"};
-    draw_menu(height - 4, 1, width - 2, menu, 5, app->selected_menu);
+    static const char *menu[] = {"Set variable", "Set match", "Set expected", "Back"};
+    draw_menu(height - 4, 1, width - 2, menu, 4, app->selected_menu);
 }
 
 static void draw_cleanup(const App *app, int height, int width) {
@@ -856,40 +1154,59 @@ static void draw_reboot(const App *app, int height, int width) {
 
 static void draw_script_editor(const App *app, int height, int width) {
     draw_header(app, width);
-    draw_box(3, 0, height - 5, width, "Create Test Script Editor");
+    char title[TEXT_LEN];
+    snprintf(title, sizeof(title), "Text Editor: %s", editor_target_name(app->editor_target));
+    draw_box(3, 0, height - 5, width, title);
     if (app->project.case_count > 0) {
         const TestCase *tc = &app->project.cases[app->selected_case];
         mvprintw(4, 2, "%s %s", tc->id, tc->title);
     }
+    bool regex_templates = editor_uses_regex_templates(app);
     int rows = height - 10;
     for (int i = 0; i < rows && i < app->editor_line_count; i++) {
         int y = 6 + i;
         mvprintw(y, 2, "%3d ", i + 1);
-        print_clip(y, 7, width - 9, app->editor_lines[i]);
+        print_editor_line(y, 7, width - 9, app->editor_lines[i]);
         if (i == app->editor_row) {
-            int len = (int)strlen(app->editor_lines[i]);
-            int cx = 7 + app->editor_col;
-            if (cx < width - 1) {
-                attron(A_UNDERLINE);
-                if (app->editor_col < len) {
-                    mvaddch(y, cx, app->editor_lines[i][app->editor_col]);
-                } else {
-                    mvaddch(y, cx, '_');
-                }
-                attroff(A_UNDERLINE);
-            }
+            draw_editor_cursor(app, y, 7, width - 9, app->editor_lines[i]);
         }
+    }
+    if (regex_templates) {
+        mvhline(height - 5, 1, ' ', width - 2);
+        mvprintw(height - 5, 2, "Regex templates: :template");
     }
     mvprintw(height - 4, 2, "-- %s --  Arrow move  i insert  Esc normal  :wq save  :q cancel",
              app->editor_insert ? "INSERT" : "NORMAL");
     if (!app->editor_insert && app->editor_command_mode) {
         mvprintw(height - 3, 2, ":%s", app->editor_command);
     } else {
-        mvprintw(height - 3, 2, "Create the shell script body for this test.");
+        mvprintw(height - 3, 2, "Editing %s.", editor_target_name(app->editor_target));
+    }
+    if (regex_templates && app->regex_template_list_open) {
+        int box_h = REGEX_TEMPLATE_COUNT + 4;
+        int box_w = 58;
+        if (box_w > width - 8) box_w = width - 8;
+        if (box_h > height - 6) box_h = height - 6;
+        int y = (height - box_h) / 2;
+        int x = (width - box_w) / 2;
+        for (int row = 0; row < box_h; row++) {
+            mvhline(y + row, x, ' ', box_w);
+        }
+        draw_box(y, x, box_h, box_w, "Regex Templates");
+        mvprintw(y + 1, x + 2, "Tab/Up/Down select  Enter insert  Esc close");
+        int list_rows = box_h - 3;
+        for (int i = 0; i < REGEX_TEMPLATE_COUNT && i < list_rows; i++) {
+            if (i == app->selected_menu) attron(A_REVERSE);
+            mvprintw(y + 2 + i, x + 2, "%-12s %.*s",
+                     REGEX_TEMPLATES[i].label,
+                     box_w - 18,
+                     REGEX_TEMPLATES[i].text);
+            if (i == app->selected_menu) attroff(A_REVERSE);
+        }
     }
     if (app->editor_insert) {
         int cy = 6 + app->editor_row;
-        int cx = 7 + app->editor_col;
+        int cx = 7 + editor_visual_col(app->editor_lines[app->editor_row], app->editor_col);
         if (cy < height - 4 && cx < width - 1) move(cy, cx);
     }
 }
@@ -932,7 +1249,7 @@ static void preview_script(App *app) {
             snprintf(line, sizeof(line), "  bash -c '%s' >\"$WORK_DIR/case_%03d.stdout\" 2>\"$WORK_DIR/case_%03d.stderr\"", tc->command, i + 1, i + 1);
             preview_add(app, line);
             preview_add(app, "  actual_exit=$?");
-            snprintf(line, sizeof(line), "  # OK when actual_exit == %d and output checks pass", tc->expected_exit);
+            snprintf(line, sizeof(line), "  # OK when actual_exit == %d and variable check passes", tc->expected_exit);
             preview_add(app, line);
         }
         snprintf(line, sizeof(line), "  echo \"[OK/NG] %s %s\"", tc->id, tc->title);
@@ -1077,8 +1394,8 @@ static void quote_for_printf(char *dst, size_t dst_sz, const char *src) {
 static void set_reboot_command(TestCase *tc) {
     tc->kind = CMD_REBOOT;
     tc->expected_exit = 0;
-    tc->stdout_match = MATCH_NONE;
-    tc->stderr_match = MATCH_EMPTY;
+    copy_text(tc->check_var, sizeof(tc->check_var), "AUTOTEST_ACTUAL");
+    tc->check_match = MATCH_NONE;
     copy_text(tc->command, sizeof(tc->command), "__AUTOTEST_REBOOT__");
 }
 
@@ -1096,8 +1413,8 @@ static void set_vim_command(TestCase *tc) {
              qtext, qpath);
     tc->kind = CMD_VIM;
     tc->expected_exit = 0;
-    tc->stdout_match = MATCH_NONE;
-    tc->stderr_match = MATCH_EMPTY;
+    copy_text(tc->check_var, sizeof(tc->check_var), "AUTOTEST_ACTUAL");
+    tc->check_match = MATCH_NONE;
 }
 
 static void editor_insert_char(App *app, int ch) {
@@ -1109,6 +1426,12 @@ static void editor_insert_char(App *app, int ch) {
     memmove(line + app->editor_col + 1, line + app->editor_col, (size_t)(len - app->editor_col + 1));
     line[app->editor_col] = (char)ch;
     app->editor_col++;
+}
+
+static void editor_insert_text(App *app, const char *text) {
+    for (size_t i = 0; text && text[i]; i++) {
+        editor_insert_char(app, (unsigned char)text[i]);
+    }
 }
 
 static void editor_newline(App *app) {
@@ -1168,6 +1491,8 @@ static void handle_script_editor_key(App *app, int ch) {
             app->editor_row--;
         } else if (ch == KEY_DOWN && app->editor_row + 1 < app->editor_line_count) {
             app->editor_row++;
+        } else if (ch == '\t') {
+            editor_insert_char(app, '\t');
         } else if (isprint(ch)) {
             editor_insert_char(app, ch);
         }
@@ -1181,18 +1506,29 @@ static void handle_script_editor_key(App *app, int ch) {
             app->editor_command[app->editor_command_len] = '\0';
             if (strcmp(app->editor_command, "wq") == 0) {
                 save_editor_to_case(app);
-                if (write_single_test_script(&app->project.cases[app->selected_case]) == 0) {
+                if (app->editor_target == EDIT_TARGET_COMMAND &&
+                    write_single_test_script(&app->project.cases[app->selected_case]) == 0) {
                     save_test_registry(&app->project);
                     set_status(app, "Saved test script in current directory.");
+                } else if (app->editor_target != EDIT_TARGET_COMMAND) {
+                    if (app->project.cases[app->selected_case].script_path[0]) {
+                        write_single_test_script(&app->project.cases[app->selected_case]);
+                    }
+                    save_test_registry(&app->project);
+                    set_status(app, "Saved variable expectation.");
                 } else {
                     set_status(app, "Failed to save test script.");
                 }
-                app->editor_new_case = false;
-                app->screen = SCREEN_EDITOR;
+                if (app->editor_target == EDIT_TARGET_COMMAND) app->editor_new_case = false;
+                app->screen = app->previous_screen;
             } else if (strcmp(app->editor_command, "q") == 0) {
-                discard_current_case_if_new(app);
-                app->screen = SCREEN_EDITOR;
+                if (app->editor_target == EDIT_TARGET_COMMAND) discard_current_case_if_new(app);
+                app->screen = app->previous_screen;
                 set_status(app, "Canceled script editor.");
+            } else if (strcmp(app->editor_command, "template") == 0 && editor_uses_regex_templates(app)) {
+                app->regex_template_list_open = true;
+                app->selected_menu = 0;
+                set_status(app, "Opened regex templates.");
             } else {
                 set_status(app, "Unknown editor command.");
             }
@@ -1210,6 +1546,29 @@ static void handle_script_editor_key(App *app, int ch) {
             app->editor_command_mode = false;
         }
         return;
+    }
+
+    if (editor_uses_regex_templates(app)) {
+        if (app->regex_template_list_open && ch == 27) {
+            app->regex_template_list_open = false;
+            set_status(app, "Closed regex templates.");
+            return;
+        }
+        if (app->regex_template_list_open && (ch == '\t' || ch == KEY_DOWN)) {
+            app->selected_menu = (app->selected_menu + 1) % REGEX_TEMPLATE_COUNT;
+            return;
+        }
+        if (app->regex_template_list_open && (ch == KEY_BTAB || ch == KEY_UP)) {
+            app->selected_menu--;
+            if (app->selected_menu < 0) app->selected_menu = REGEX_TEMPLATE_COUNT - 1;
+            return;
+        }
+        if (app->regex_template_list_open && (ch == '\n' || ch == KEY_ENTER)) {
+            if (app->selected_menu < 0 || app->selected_menu >= REGEX_TEMPLATE_COUNT) app->selected_menu = 0;
+            editor_insert_text(app, REGEX_TEMPLATES[app->selected_menu].text);
+            set_status(app, "Inserted regex template.");
+            return;
+        }
     }
 
     switch (ch) {
@@ -1285,8 +1644,8 @@ static void add_case(App *app) {
     tc->kind = CMD_SHELL;
     tc->selected = true;
     tc->expected_exit = 0;
-    tc->stdout_match = MATCH_NONE;
-    tc->stderr_match = MATCH_EMPTY;
+    copy_text(tc->check_var, sizeof(tc->check_var), "AUTOTEST_ACTUAL");
+    tc->check_match = MATCH_NONE;
     tc->timeout_sec = 30;
     app->selected_case = app->project.case_count;
     app->project.case_count++;
@@ -1339,49 +1698,56 @@ static void edit_selected_field(App *app) {
     case 3: cycle_kind(tc); break;
     case 4: prompt_text("command", tc->command, sizeof(tc->command)); tc->kind = CMD_SHELL; break;
     case 5: tc->expected_exit = prompt_int("expected_exit", tc->expected_exit); break;
-    case 6: cycle_match(&tc->stdout_match); break;
-    case 7: prompt_text("stdout_expected", tc->stdout_expected, sizeof(tc->stdout_expected)); break;
-    case 8: cycle_match(&tc->stderr_match); break;
-    case 9: prompt_text("stderr_expected", tc->stderr_expected, sizeof(tc->stderr_expected)); break;
-    case 10: prompt_text("cleanup", tc->cleanup, sizeof(tc->cleanup)); break;
-    case 11: tc->timeout_sec = prompt_int("timeout_sec", tc->timeout_sec); break;
-    case 12: tc->requires_root = !tc->requires_root; break;
-    case 13: set_status(app, "script_path is set when the editor is saved."); break;
+    case 6: prompt_text("check_var", tc->check_var, sizeof(tc->check_var)); break;
+    case 7: cycle_match(&tc->check_match); break;
+    case 8: open_text_editor(app, EDIT_TARGET_CHECK_EXPECTED, SCREEN_FORM); break;
+    case 9: prompt_text("cleanup", tc->cleanup, sizeof(tc->cleanup)); break;
+    case 10: tc->timeout_sec = prompt_int("timeout_sec", tc->timeout_sec); break;
+    case 11: tc->requires_root = !tc->requires_root; break;
+    case 12: set_status(app, "script_path is set when the editor is saved."); break;
     default: break;
     }
     set_status(app, "Updated field.");
 }
 
 static void write_match_function(FILE *f) {
-    fputs("match_output() {\n", f);
-    fputs("  file=\"$1\"\n", f);
-    fputs("  type=\"$2\"\n", f);
+    fputs("is_valid_var_name() {\n", f);
+    fputs("  case \"$1\" in ''|[0-9]*|*[!A-Za-z0-9_]*) return 1 ;; *) return 0 ;; esac\n", f);
+    fputs("}\n\n", f);
+    fputs("match_value() {\n", f);
+    fputs("  type=\"$1\"\n", f);
+    fputs("  actual=\"$2\"\n", f);
     fputs("  expected=\"$3\"\n", f);
     fputs("  case \"$type\" in\n", f);
     fputs("    none) return 0 ;;\n", f);
-    fputs("    exact) actual=$(cat \"$file\"); [ \"$actual\" = \"$expected\" ] ;;\n", f);
-    fputs("    contains) grep -Fq -- \"$expected\" \"$file\" ;;\n", f);
-    fputs("    regex) grep -Eq -- \"$expected\" \"$file\" ;;\n", f);
-    fputs("    empty) [ ! -s \"$file\" ] ;;\n", f);
-    fputs("    not_empty) [ -s \"$file\" ] ;;\n", f);
+    fputs("    exact) [ \"$actual\" = \"$expected\" ] ;;\n", f);
+    fputs("    contains) case \"$actual\" in *\"$expected\"*) return 0 ;; *) return 1 ;; esac ;;\n", f);
+    fputs("    regex) printf '%s\\n' \"$actual\" | grep -Eq -- \"$expected\" ;;\n", f);
+    fputs("    empty) [ -z \"$actual\" ] ;;\n", f);
+    fputs("    not_empty) [ -n \"$actual\" ] ;;\n", f);
     fputs("    *) return 1 ;;\n", f);
     fputs("  esac\n", f);
     fputs("}\n\n", f);
+}
+
+static void write_rescue_continue(FILE *f, const char *indent) {
+    fprintf(f, "%sdefault_target=$(systemctl get-default 2>/dev/null || true)\n", indent);
+    fprintf(f, "%sif [ \"$default_target\" = \"multi-user.target\" ] || [ \"$default_target\" = \"runlevel2.target\" ] || [ \"$default_target\" = \"runlevel3.target\" ] || [ \"$default_target\" = \"runlevel4.target\" ]; then\n", indent);
+    fprintf(f, "%s  systemctl default --no-block >/dev/null 2>&1 || true\n", indent);
+    fprintf(f, "%s  systemd-run --on-active=5s /bin/sh -c 'systemctl restart systemd-update-utmp-runlevel.service >/dev/null 2>&1 || /lib/systemd/systemd-update-utmp runlevel >/dev/null 2>&1 || true' >/dev/null 2>&1 || true\n", indent);
+    fprintf(f, "%selif systemctl -q is-active rescue.target 2>/dev/null; then\n", indent);
+    fprintf(f, "%s  systemctl default --no-block >/dev/null 2>&1 || true\n", indent);
+    fprintf(f, "%s  systemd-run --on-active=5s /bin/sh -c 'systemctl restart systemd-update-utmp-runlevel.service >/dev/null 2>&1 || /lib/systemd/systemd-update-utmp runlevel >/dev/null 2>&1 || true' >/dev/null 2>&1 || true\n", indent);
+    fprintf(f, "%sfi\n", indent);
 }
 
 static void write_case(FILE *f, const TestCase *tc, int index) {
     char ok_msg[LONG_LEN];
     char ng_prefix[LONG_LEN];
     char safe_id[64];
-    size_t safe_len = 0;
     snprintf(ok_msg, sizeof(ok_msg), "[OK] %s %s", tc->id, tc->title);
     snprintf(ng_prefix, sizeof(ng_prefix), "[NG] %s %s expected_exit=%d actual_exit=", tc->id, tc->title, tc->expected_exit);
-    for (size_t i = 0; tc->id[i] && safe_len + 1 < sizeof(safe_id); i++) {
-        unsigned char c = (unsigned char)tc->id[i];
-        safe_id[safe_len++] = (char)(isalnum(c) ? tolower(c) : '-');
-    }
-    safe_id[safe_len ? safe_len : 0] = '\0';
-    if (!safe_id[0]) copy_text(safe_id, sizeof(safe_id), "test");
+    make_safe_id(tc->id, safe_id, sizeof(safe_id), '-');
 
     fprintf(f, "run_case_%03d() {\n", index + 1);
     fprintf(f, "  TOTAL_COUNT=$((TOTAL_COUNT + 1))\n");
@@ -1391,17 +1757,19 @@ static void write_case(FILE *f, const TestCase *tc, int index) {
         fprintf(f, "  unit_name=\"autotest-%s-resume.service\"\n", safe_id);
         fprintf(f, "  stdout_file=\"$state_dir/stdout\"\n");
         fprintf(f, "  stderr_file=\"$state_dir/stderr\"\n");
+        fprintf(f, "  actual_file=\"$state_dir/actual\"\n");
+        fprintf(f, "  check_var=");
+        shell_quote(f, tc->check_var);
+        fprintf(f, "\n");
         fprintf(f, "  finish_reboot_case() {\n");
         fprintf(f, "    actual_exit=\"$1\"\n");
+        fprintf(f, "    actual_value=$(cat \"$actual_file\" 2>/dev/null || true)\n");
         fprintf(f, "    ok=1\n");
         fprintf(f, "    [ \"$actual_exit\" -eq %d ] || ok=0\n", tc->expected_exit);
-        fprintf(f, "    match_output \"$stdout_file\" %s ", match_name(tc->stdout_match));
-        shell_quote(f, tc->stdout_expected);
+        fprintf(f, "    match_value %s \"$actual_value\" ", match_name(tc->check_match));
+        shell_quote(f, tc->check_expected);
         fprintf(f, " || ok=0\n");
-        fprintf(f, "    match_output \"$stderr_file\" %s ", match_name(tc->stderr_match));
-        shell_quote(f, tc->stderr_expected);
-        fprintf(f, " || ok=0\n");
-        fprintf(f, "    systemctl disable --now \"$unit_name\" >/dev/null 2>&1 || true\n");
+        fprintf(f, "    systemctl disable \"$unit_name\" >/dev/null 2>&1 || true\n");
         fprintf(f, "    rm -f \"/etc/systemd/system/$unit_name\"\n");
         fprintf(f, "    systemctl daemon-reload >/dev/null 2>&1 || true\n");
         if (tc->cleanup[0]) fprintf(f, "    %s || true\n", tc->cleanup);
@@ -1423,6 +1791,9 @@ static void write_case(FILE *f, const TestCase *tc, int index) {
         fprintf(f, "    {\n");
         fprintf(f, "      echo \"$status_msg\"\n");
         fprintf(f, "      echo \"Summary: total=$TOTAL_COUNT OK=$OK_COUNT NG=$NG_COUNT\"\n");
+        fprintf(f, "      echo \"check_var=$check_var\"\n");
+        fprintf(f, "      echo \"actual_value=$actual_value\"\n");
+        fprintf(f, "      echo \"actual_file=$actual_file\"\n");
         fprintf(f, "      echo \"stdout_file=$stdout_file\"\n");
         fprintf(f, "      echo \"stderr_file=$stderr_file\"\n");
         fprintf(f, "      echo '--- stdout ---'\n");
@@ -1431,6 +1802,7 @@ static void write_case(FILE *f, const TestCase *tc, int index) {
         fprintf(f, "      [ -f \"$stderr_file\" ] && cat \"$stderr_file\"\n");
         fprintf(f, "    } >\"$RESULT_FILE\"\n");
         fprintf(f, "    rm -rf \"$state_dir\"\n");
+        write_rescue_continue(f, "    ");
         fprintf(f, "  }\n");
         fprintf(f, "  mkdir -p \"$state_dir\"\n");
         fprintf(f, "  cat >\"$state_dir/pre.sh\" <<'AUTOTEST_PRE'\n");
@@ -1443,21 +1815,22 @@ static void write_case(FILE *f, const TestCase *tc, int index) {
         write_command_phase(f, tc->command, true);
         fprintf(f, "AUTOTEST_POST\n");
         fprintf(f, "  chmod 700 \"$state_dir/pre.sh\" \"$state_dir/reboot.sh\" \"$state_dir/post.sh\"\n");
+        fprintf(f, "  if ! is_valid_var_name \"$check_var\"; then status_msg='[NG] invalid check variable name'; echo \"$status_msg\"; echo \"$status_msg\" >\"$RESULT_FILE\"; NG_COUNT=$((NG_COUNT + 1)); return; fi\n");
         fprintf(f, "  if [ \"$mode\" = \"--resume\" ]; then\n");
-        fprintf(f, "    bash \"$state_dir/post.sh\" >>\"$stdout_file\" 2>>\"$stderr_file\"\n");
+        fprintf(f, "    ( set -a; [ -f \"$state_dir/env.sh\" ] && . \"$state_dir/env.sh\"; . \"$state_dir/post.sh\"; post_rc=\"$?\"; printf '%%s' \"${!check_var-}\" >\"$actual_file\"; exit \"$post_rc\" ) >>\"$stdout_file\" 2>>\"$stderr_file\"\n");
         fprintf(f, "    finish_reboot_case \"$?\"\n");
         fprintf(f, "    return\n");
         fprintf(f, "  fi\n");
         fprintf(f, "  : >\"$stdout_file\"\n");
         fprintf(f, "  : >\"$stderr_file\"\n");
-        fprintf(f, "  bash \"$state_dir/pre.sh\" >>\"$stdout_file\" 2>>\"$stderr_file\"\n");
+        fprintf(f, "  ( set -a; . \"$state_dir/pre.sh\"; pre_rc=\"$?\"; printf '%%s' \"${!check_var-}\" >\"$actual_file\"; export -p >\"$state_dir/env.sh\"; exit \"$pre_rc\" ) >>\"$stdout_file\" 2>>\"$stderr_file\"\n");
         fprintf(f, "  pre_exit=\"$?\"\n");
         fprintf(f, "  if [ \"$pre_exit\" -ne 0 ]; then finish_reboot_case \"$pre_exit\"; return; fi\n");
         fprintf(f, "  if [ \"$(id -u)\" -ne 0 ]; then status_msg='[NG] root required for reboot test resume'; echo \"$status_msg\"; echo \"$status_msg\" >\"$RESULT_FILE\"; NG_COUNT=$((NG_COUNT + 1)); return; fi\n");
         fprintf(f, "  self_path=\"$(readlink -f \"$0\")\"\n");
         fprintf(f, "  cat >\"/etc/systemd/system/$unit_name\" <<AUTOTEST_UNIT\n");
-        fprintf(f, "[Unit]\nDescription=AutoTest %s resume\nAfter=multi-user.target\n\n", safe_id);
-        fprintf(f, "[Service]\nType=oneshot\nExecStart=/bin/bash \"$self_path\" --resume\n\n[Install]\nWantedBy=multi-user.target\n");
+        fprintf(f, "[Unit]\nDescription=AutoTest %s resume\nDefaultDependencies=no\nAfter=sysinit.target\nBefore=rescue.service\nBefore=shutdown.target\nConflicts=shutdown.target\n\n", safe_id);
+        fprintf(f, "[Service]\nType=oneshot\nExecStart=/bin/bash \"$self_path\" --resume\n\n[Install]\nWantedBy=multi-user.target rescue.target\n");
         fprintf(f, "AUTOTEST_UNIT\n");
         fprintf(f, "  systemctl daemon-reload\n");
         fprintf(f, "  systemctl enable \"$unit_name\"\n");
@@ -1470,17 +1843,22 @@ static void write_case(FILE *f, const TestCase *tc, int index) {
     }
     fprintf(f, "  stdout_file=\"$WORK_DIR/case_%03d.stdout\"\n", index + 1);
     fprintf(f, "  stderr_file=\"$WORK_DIR/case_%03d.stderr\"\n", index + 1);
-    fprintf(f, "  bash -c ");
-    shell_quote(f, tc->command);
-    fprintf(f, " >\"$stdout_file\" 2>\"$stderr_file\"\n");
+    fprintf(f, "  actual_file=\"$WORK_DIR/case_%03d.actual\"\n", index + 1);
+    fprintf(f, "  check_var=");
+    shell_quote(f, tc->check_var);
+    fprintf(f, "\n");
+    fprintf(f, "  body_file=\"$WORK_DIR/case_%03d.body.sh\"\n", index + 1);
+    fprintf(f, "  cat >\"$body_file\" <<'AUTOTEST_BODY_%03d'\n", index + 1);
+    write_command_expanded(f, tc->command);
+    fprintf(f, "AUTOTEST_BODY_%03d\n", index + 1);
+    fprintf(f, "  if ! is_valid_var_name \"$check_var\"; then echo '[NG] invalid check variable name' >&2; NG_COUNT=$((NG_COUNT + 1)); return; fi\n");
+    fprintf(f, "  ( set -a; . \"$body_file\"; body_rc=\"$?\"; printf '%%s' \"${!check_var-}\" >\"$actual_file\"; exit \"$body_rc\" ) >\"$stdout_file\" 2>\"$stderr_file\"\n");
     fprintf(f, "  actual_exit=$?\n");
+    fprintf(f, "  actual_value=$(cat \"$actual_file\" 2>/dev/null || true)\n");
     fprintf(f, "  ok=1\n");
     fprintf(f, "  [ \"$actual_exit\" -eq %d ] || ok=0\n", tc->expected_exit);
-    fprintf(f, "  match_output \"$stdout_file\" %s ", match_name(tc->stdout_match));
-    shell_quote(f, tc->stdout_expected);
-    fprintf(f, " || ok=0\n");
-    fprintf(f, "  match_output \"$stderr_file\" %s ", match_name(tc->stderr_match));
-    shell_quote(f, tc->stderr_expected);
+    fprintf(f, "  match_value %s \"$actual_value\" ", match_name(tc->check_match));
+    shell_quote(f, tc->check_expected);
     fprintf(f, " || ok=0\n");
     fprintf(f, "  if [ \"$ok\" -eq 1 ]; then\n");
     fprintf(f, "    echo ");
@@ -1491,6 +1869,8 @@ static void write_case(FILE *f, const TestCase *tc, int index) {
     fprintf(f, "    echo ");
     shell_quote(f, ng_prefix);
     fprintf(f, "\"$actual_exit\"\n");
+    fprintf(f, "    echo \"     check_var: $check_var\"\n");
+    fprintf(f, "    echo \"     actual: $actual_file\"\n");
     fprintf(f, "    echo \"     stdout: $stdout_file\"\n");
     fprintf(f, "    echo \"     stderr: $stderr_file\"\n");
     fprintf(f, "    NG_COUNT=$((NG_COUNT + 1))\n");
@@ -1540,6 +1920,7 @@ static int write_resume_automation(App *app, char *runner_path, size_t runner_sz
     char cwd[LONG_LEN];
     char resume_path[LONG_LEN];
     char unit_path[LONG_LEN];
+    char result_path[LONG_LEN];
     int reboot_idx = first_selected_reboot_index(app);
     if (reboot_idx < 0) return -1;
     if (ensure_selected_test_scripts(app) != 0) return -1;
@@ -1549,44 +1930,140 @@ static int write_resume_automation(App *app, char *runner_path, size_t runner_sz
     snprintf(runner_path, runner_sz, "%s/autotest_selected_runner.sh", cwd);
     snprintf(resume_path, sizeof(resume_path), "%s/autotest_selected_resume.sh", cwd);
     snprintf(unit_path, sizeof(unit_path), "%s/autotest-selected-resume.service", cwd);
+    snprintf(result_path, sizeof(result_path), "%s/autotest_selected.result", cwd);
 
     FILE *f = fopen(resume_path, "w");
     if (!f) return -1;
     fprintf(f, "#!/usr/bin/env bash\nset -u\n");
-    fprintf(f, "echo 'Resuming selected tests after reboot.'\n");
-    {
-        const TestCase *reboot_tc = &app->project.cases[reboot_idx];
-        char safe_id[64];
-        size_t safe_len = 0;
-        for (size_t i = 0; reboot_tc->id[i] && safe_len + 1 < sizeof(safe_id); i++) {
-            unsigned char c = (unsigned char)reboot_tc->id[i];
-            safe_id[safe_len++] = (char)(isalnum(c) ? tolower(c) : '-');
-        }
-        safe_id[safe_len ? safe_len : 0] = '\0';
-        if (!safe_id[0]) copy_text(safe_id, sizeof(safe_id), "test");
-        fprintf(f, "echo 'Waiting for reboot test resume to finish.'\n");
-        fprintf(f, "for n in $(seq 1 300); do [ ! -d /var/tmp/autotest-%s-state ] && break; sleep 1; done\n", safe_id);
-    }
-    for (int i = reboot_idx + 1; i < app->project.case_count; i++) {
+    fprintf(f, "STATE_DIR=/var/tmp/autotest-selected-state\n");
+    fprintf(f, "UNIT_NAME=autotest-selected-resume.service\n");
+    fprintf(f, "INDEX_FILE=\"$STATE_DIR/index\"\n");
+    fprintf(f, "FAIL_FILE=\"$STATE_DIR/failures\"\n");
+    fprintf(f, "WAIT_SAFE_FILE=\"$STATE_DIR/waiting_safe_id\"\n");
+    fprintf(f, "WAIT_RESULT_FILE=\"$STATE_DIR/waiting_result\"\n");
+    fprintf(f, "SUMMARY_PATH=");
+    shell_quote_str(f, result_path);
+    fprintf(f, "\n");
+    fprintf(f, "ids=(");
+    for (int i = 0; i < app->project.case_count; i++) {
         TestCase *tc = &app->project.cases[i];
         if (!tc->selected) continue;
-        fprintf(f, "echo ");
         shell_quote_str(f, tc->id);
-        fprintf(f, "\n");
-        fprintf(f, "bash ");
-        shell_quote_str(f, tc->script_path);
-        fprintf(f, "\n");
+        fprintf(f, " ");
     }
-    fprintf(f, "systemctl disable --now autotest-selected-resume.service >/dev/null 2>&1 || true\n");
-    fprintf(f, "rm -f /etc/systemd/system/autotest-selected-resume.service\n");
-    fprintf(f, "systemctl daemon-reload >/dev/null 2>&1 || true\n");
+    fprintf(f, ")\n");
+    fprintf(f, "paths=(");
+    for (int i = 0; i < app->project.case_count; i++) {
+        TestCase *tc = &app->project.cases[i];
+        if (!tc->selected) continue;
+        shell_quote_str(f, tc->script_path);
+        fprintf(f, " ");
+    }
+    fprintf(f, ")\n");
+    fprintf(f, "kinds=(");
+    for (int i = 0; i < app->project.case_count; i++) {
+        TestCase *tc = &app->project.cases[i];
+        if (!tc->selected) continue;
+        auto_configure_test(tc);
+        shell_quote_str(f, tc->kind == CMD_REBOOT ? "reboot" : "shell");
+        fprintf(f, " ");
+    }
+    fprintf(f, ")\n");
+    fprintf(f, "safe_ids=(");
+    for (int i = 0; i < app->project.case_count; i++) {
+        TestCase *tc = &app->project.cases[i];
+        char safe_id[64];
+        if (!tc->selected) continue;
+        make_safe_id(tc->id, safe_id, sizeof(safe_id), '-');
+        shell_quote_str(f, safe_id);
+        fprintf(f, " ");
+    }
+    fprintf(f, ")\n");
+    fprintf(f, "count=${#paths[@]}\n");
+    fprintf(f, "log() { echo \"$*\" | tee -a \"$SUMMARY_PATH\"; }\n");
+    fprintf(f, "read_num() { if [ -f \"$1\" ]; then cat \"$1\"; else echo 0; fi; }\n");
+    fprintf(f, "write_failures() { echo \"$1\" >\"$FAIL_FILE\"; }\n");
+    fprintf(f, "cleanup_selected_runner() {\n");
+    fprintf(f, "  systemctl disable \"$UNIT_NAME\" >/dev/null 2>&1 || true\n");
+    fprintf(f, "  rm -f \"/etc/systemd/system/$UNIT_NAME\"\n");
+    fprintf(f, "  systemctl daemon-reload >/dev/null 2>&1 || true\n");
+    fprintf(f, "  rm -rf \"$STATE_DIR\"\n");
+    write_rescue_continue(f, "  ");
+    fprintf(f, "}\n");
+    fprintf(f, "check_waiting_reboot() {\n");
+    fprintf(f, "  [ -f \"$WAIT_SAFE_FILE\" ] || return 0\n");
+    fprintf(f, "  safe_id=$(cat \"$WAIT_SAFE_FILE\")\n");
+    fprintf(f, "  result_file=$(cat \"$WAIT_RESULT_FILE\" 2>/dev/null || true)\n");
+    fprintf(f, "  log \"Waiting for reboot test $safe_id to finish.\"\n");
+    fprintf(f, "  for n in $(seq 1 600); do [ ! -d \"/var/tmp/autotest-${safe_id}-state\" ] && break; sleep 1; done\n");
+    fprintf(f, "  failures=$(read_num \"$FAIL_FILE\")\n");
+    fprintf(f, "  if [ -d \"/var/tmp/autotest-${safe_id}-state\" ]; then\n");
+    fprintf(f, "    log \"[NG] reboot test $safe_id did not finish after boot\"\n");
+    fprintf(f, "    failures=$((failures + 1))\n");
+    fprintf(f, "  elif [ -n \"$result_file\" ] && [ -f \"$result_file\" ]; then\n");
+    fprintf(f, "    if grep -q '^\\[NG\\]' \"$result_file\"; then failures=$((failures + 1)); fi\n");
+    fprintf(f, "    log \"result: $result_file\"\n");
+    fprintf(f, "  else\n");
+    fprintf(f, "    log \"[NG] reboot test $safe_id result file was not found\"\n");
+    fprintf(f, "    failures=$((failures + 1))\n");
+    fprintf(f, "  fi\n");
+    fprintf(f, "  write_failures \"$failures\"\n");
+    fprintf(f, "  rm -f \"$WAIT_SAFE_FILE\" \"$WAIT_RESULT_FILE\"\n");
+    fprintf(f, "}\n");
+    fprintf(f, "mkdir -p \"$STATE_DIR\"\n");
+    fprintf(f, "touch \"$SUMMARY_PATH\"\n");
+    fprintf(f, "check_waiting_reboot\n");
+    fprintf(f, "idx=$(read_num \"$INDEX_FILE\")\n");
+    fprintf(f, "failures=$(read_num \"$FAIL_FILE\")\n");
+    fprintf(f, "while [ \"$idx\" -lt \"$count\" ]; do\n");
+    fprintf(f, "  id=${ids[$idx]}\n");
+    fprintf(f, "  path=${paths[$idx]}\n");
+    fprintf(f, "  kind=${kinds[$idx]}\n");
+    fprintf(f, "  safe_id=${safe_ids[$idx]}\n");
+    fprintf(f, "  result_file=\"${path%%.sh}.result\"\n");
+    fprintf(f, "  log \"[$((idx + 1))/$count] $id $path\"\n");
+    fprintf(f, "  if [ \"$kind\" = \"reboot\" ]; then\n");
+    fprintf(f, "    echo $((idx + 1)) >\"$INDEX_FILE\"\n");
+    fprintf(f, "    echo \"$safe_id\" >\"$WAIT_SAFE_FILE\"\n");
+    fprintf(f, "    echo \"$result_file\" >\"$WAIT_RESULT_FILE\"\n");
+    fprintf(f, "    bash \"$path\"\n");
+    fprintf(f, "    rc=$?\n");
+    fprintf(f, "    if [ \"$rc\" -ne 0 ]; then\n");
+    fprintf(f, "      log \"[NG] $id failed before reboot rc=$rc\"\n");
+    fprintf(f, "      failures=$((failures + 1))\n");
+    fprintf(f, "      write_failures \"$failures\"\n");
+    fprintf(f, "      rm -f \"$WAIT_SAFE_FILE\" \"$WAIT_RESULT_FILE\"\n");
+    fprintf(f, "      idx=$((idx + 1))\n");
+    fprintf(f, "      echo \"$idx\" >\"$INDEX_FILE\"\n");
+    fprintf(f, "      continue\n");
+    fprintf(f, "    fi\n");
+    fprintf(f, "    if grep -q '^\\[PENDING\\]' \"$result_file\" 2>/dev/null; then\n");
+    fprintf(f, "      log \"[PENDING] $id reboot issued; selected tests continue after boot.\"\n");
+    fprintf(f, "      write_failures \"$failures\"\n");
+    fprintf(f, "      exit 0\n");
+    fprintf(f, "    fi\n");
+    fprintf(f, "    rm -f \"$WAIT_SAFE_FILE\" \"$WAIT_RESULT_FILE\"\n");
+    fprintf(f, "    if grep -q '^\\[NG\\]' \"$result_file\" 2>/dev/null; then failures=$((failures + 1)); fi\n");
+    fprintf(f, "    write_failures \"$failures\"\n");
+    fprintf(f, "  else\n");
+    fprintf(f, "    bash \"$path\"\n");
+    fprintf(f, "    rc=$?\n");
+    fprintf(f, "    if [ \"$rc\" -ne 0 ]; then failures=$((failures + 1)); write_failures \"$failures\"; fi\n");
+    fprintf(f, "  fi\n");
+    fprintf(f, "  idx=$((idx + 1))\n");
+    fprintf(f, "  echo \"$idx\" >\"$INDEX_FILE\"\n");
+    fprintf(f, "done\n");
+    fprintf(f, "if [ \"$failures\" -eq 0 ]; then log '[OK] selected test sequence'; else log \"[NG] selected test sequence failures=$failures\"; fi\n");
+    fprintf(f, "cleanup_selected_runner\n");
+    fprintf(f, "if [ \"$failures\" -eq 0 ]; then exit 0; fi\n");
+    fprintf(f, "exit 1\n");
     fclose(f);
     chmod(resume_path, 0755);
 
     f = fopen(unit_path, "w");
     if (!f) return -1;
-    fprintf(f, "[Unit]\nDescription=AutoTest selected resume\nAfter=multi-user.target\n\n");
-    fprintf(f, "[Service]\nType=oneshot\nExecStart=%s\n\n[Install]\nWantedBy=multi-user.target\n", resume_path);
+    fprintf(f, "[Unit]\nDescription=AutoTest selected resume\nDefaultDependencies=no\nAfter=sysinit.target\nBefore=rescue.service\nBefore=shutdown.target\nConflicts=shutdown.target\n\n");
+    fprintf(f, "[Service]\nType=oneshot\nExecStart=%s\n\n[Install]\nWantedBy=multi-user.target rescue.target\n", resume_path);
     fclose(f);
 
     f = fopen(runner_path, "w");
@@ -1594,21 +2071,22 @@ static int write_resume_automation(App *app, char *runner_path, size_t runner_sz
     fprintf(f, "#!/usr/bin/env bash\nset -u\n");
     fprintf(f, "echo 'Preparing reboot resume automation.'\n");
     fprintf(f, "if [ \"$(id -u)\" -ne 0 ]; then echo 'NG root required for reboot resume automation'; exit 1; fi\n");
+    fprintf(f, "STATE_DIR=/var/tmp/autotest-selected-state\n");
+    fprintf(f, "rm -rf \"$STATE_DIR\"\n");
+    fprintf(f, "mkdir -p \"$STATE_DIR\"\n");
+    fprintf(f, "echo 0 >\"$STATE_DIR/index\"\n");
+    fprintf(f, "echo 0 >\"$STATE_DIR/failures\"\n");
+    fprintf(f, ": >");
+    shell_quote_str(f, result_path);
+    fprintf(f, "\n");
     fprintf(f, "cp ");
     shell_quote_str(f, unit_path);
     fprintf(f, " /etc/systemd/system/autotest-selected-resume.service\n");
     fprintf(f, "systemctl daemon-reload\n");
     fprintf(f, "systemctl enable autotest-selected-resume.service\n");
-    for (int i = 0; i <= reboot_idx; i++) {
-        TestCase *tc = &app->project.cases[i];
-        if (!tc->selected) continue;
-        fprintf(f, "echo ");
-        shell_quote_str(f, tc->id);
-        fprintf(f, "\n");
-        fprintf(f, "bash ");
-        shell_quote_str(f, tc->script_path);
-        fprintf(f, "\n");
-    }
+    fprintf(f, "exec ");
+    shell_quote_str(f, resume_path);
+    fprintf(f, "\n");
     fclose(f);
     chmod(runner_path, 0755);
     return 0;
@@ -1700,11 +2178,10 @@ static void run_selected_menu(App *app) {
         break;
     case SCREEN_MATCH:
         if (app->project.case_count == 0) { app->screen = SCREEN_EDITOR; break; }
-        if (app->selected_menu == 0) { cycle_match(&app->project.cases[app->selected_case].stdout_match); write_single_test_script(&app->project.cases[app->selected_case]); save_test_registry(&app->project); }
-        else if (app->selected_menu == 1) { prompt_text("stdout expected", app->project.cases[app->selected_case].stdout_expected, sizeof(app->project.cases[app->selected_case].stdout_expected)); write_single_test_script(&app->project.cases[app->selected_case]); save_test_registry(&app->project); }
-        else if (app->selected_menu == 2) { cycle_match(&app->project.cases[app->selected_case].stderr_match); write_single_test_script(&app->project.cases[app->selected_case]); save_test_registry(&app->project); }
-        else if (app->selected_menu == 3) { prompt_text("stderr expected", app->project.cases[app->selected_case].stderr_expected, sizeof(app->project.cases[app->selected_case].stderr_expected)); write_single_test_script(&app->project.cases[app->selected_case]); save_test_registry(&app->project); }
-        else if (app->selected_menu == 4) { app->screen = SCREEN_EDITOR; app->selected_menu = 0; }
+        if (app->selected_menu == 0) { prompt_text("check_var", app->project.cases[app->selected_case].check_var, sizeof(app->project.cases[app->selected_case].check_var)); write_single_test_script(&app->project.cases[app->selected_case]); save_test_registry(&app->project); }
+        else if (app->selected_menu == 1) { cycle_match(&app->project.cases[app->selected_case].check_match); write_single_test_script(&app->project.cases[app->selected_case]); save_test_registry(&app->project); }
+        else if (app->selected_menu == 2) { open_text_editor(app, EDIT_TARGET_CHECK_EXPECTED, SCREEN_MATCH); }
+        else if (app->selected_menu == 3) { app->screen = SCREEN_EDITOR; app->selected_menu = 0; }
         break;
     case SCREEN_CLEANUP:
         if (app->selected_menu == 0) {
@@ -1778,7 +2255,7 @@ static int menu_count_for(Screen s) {
     case SCREEN_DASHBOARD: return 5;
     case SCREEN_EDITOR: return 7;
     case SCREEN_FORM: return 7;
-    case SCREEN_MATCH: return 5;
+    case SCREEN_MATCH: return 4;
     case SCREEN_CLEANUP: return 6;
     case SCREEN_REBOOT: return 3;
     case SCREEN_SCRIPT_EDITOR: return 1;
