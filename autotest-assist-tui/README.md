@@ -40,6 +40,58 @@ esac
 Use `runlevel` only after the system has completed the transition and utmp has
 been updated.
 
+## `@tui` Output Capture
+
+Each `@tui` block stores the most recent pseudo-terminal session output in
+variables that can be used by later script lines and `@check` rules:
+
+- `AUTOTEST_TUI_STDOUT`: transcript captured from the pseudo terminal.
+- `AUTOTEST_TUI_STDERR`: errors emitted by the `script` wrapper itself.
+- `AUTOTEST_TUI_STATUS`: exit status from the `script` command.
+- `AUTOTEST_TUI_STDOUT_FILE` / `AUTOTEST_TUI_STDERR_FILE`: backing files.
+
+Because TUI programs run through a pseudo terminal, the program's stdout and
+stderr may be merged by the terminal layer. For assertions, prefer `contains`
+or `regex` checks against `AUTOTEST_TUI_STDOUT`.
+
+## Editor Help
+
+In any built-in editor, run `:help` from normal mode to open a centered help
+window. It lists AutoTest-specific script directives such as `@check`,
+`@assert`, `@backup`, `@restore`, `@reboot-if`, `@tui`, TUI send commands,
+captured `AUTOTEST_TUI_*` variables, and the editor's normal-mode commands.
+Use Up/Down to scroll the help window when the terminal is small. PageUp,
+PageDown, Home, and End are also supported. Close the help window with `Esc`,
+`Enter`, or `q`.
+
+## Generated Script Names
+
+When a test is saved, the generated script name is based on the test title:
+`<test-title>.sh`. Spaces and unsafe path characters are normalized for
+filenames. If the title is empty, the test id is used as a fallback.
+
+Saving fails if another file with the same generated name already exists in the
+same directory. To rename a test script later, change the test title and run
+`Save test`; the script path is recalculated in the same directory, and the old
+script/result files are removed after the new script is written.
+
+From the test list, use `Rename test` to change an existing test title directly.
+The new name is checked immediately; if the generated script name already
+exists, the rename is rejected before the script is rewritten.
+
+## Generated Script Options
+
+Generated test scripts support an optional detailed result file:
+
+```sh
+./service_check.sh --detail-result /tmp/service_check.detail
+```
+
+The normal terminal output remains OK/NG focused. The detailed result file
+includes the status line, summary, expected/actual exit codes, variable check
+names and values, captured stdout, and captured stderr. For reboot tests, the
+detail result path is saved before reboot and reused by the resume run.
+
 Linux 向けの「自動テスト作成支援」TUI です。`Create test` から独自エディタを開いてテストを作成し、作成済みテストを複数選択して自動テストを開始できます。
 
 生成されるテストスクリプトは、各テスト項目を実行し、終了コードと出力判定から結果を `OK` または `NG` として表示します。

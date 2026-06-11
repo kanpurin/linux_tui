@@ -101,6 +101,8 @@ typedef struct {
     bool editor_search_mode;
     bool editor_new_case;
     bool regex_template_list_open;
+    bool editor_help_open;
+    int editor_help_scroll;
     EditorTarget editor_target;
     char editor_normal_command[16];
     int editor_normal_command_len;
@@ -143,6 +145,45 @@ static const RegexTemplate REGEX_TEMPLATES[] = {
 };
 
 #define REGEX_TEMPLATE_COUNT ((int)(sizeof(REGEX_TEMPLATES) / sizeof(REGEX_TEMPLATES[0])))
+
+static const char *EDITOR_HELP_LINES[] = {
+    "Close: Esc / Enter / q    Scroll: Up/Down PgUp/PgDn",
+    "",
+    "Script directives",
+    "@check <var> <match> <expected>  Add a variable assertion.",
+    "@assert <condition>             Fail immediately when condition is false.",
+    "@backup <path>                  Save file or directory before mutation.",
+    "@restore <path>                 Restore a previously backed-up path.",
+    "@reboot-if <condition>          Reboot only when condition is true.",
+    "",
+    "TUI automation",
+    "@tui <command>                  Start pseudo-terminal automation.",
+    "@end                            End the @tui block.",
+    "send <keys>                     Send literal keys without newline.",
+    "send-shell <expr>               Send shell-expanded text.",
+    "text <text>                     Send text plus newline.",
+    "text-shell <expr>               Send shell-expanded text plus newline.",
+    "enter / esc / tab / space       Send common keys.",
+    "sleep <seconds>                 Wait.",
+    "ctrl <key>                      Send Ctrl key, example: ctrl c.",
+    "",
+    "TUI output variables",
+    "AUTOTEST_TUI_STDOUT             Last pseudo-terminal transcript.",
+    "AUTOTEST_TUI_STDERR             Last script-wrapper stderr.",
+    "AUTOTEST_TUI_STATUS             Last script-wrapper exit status.",
+    "AUTOTEST_TUI_STDOUT_FILE        Transcript backing file.",
+    "AUTOTEST_TUI_STDERR_FILE        Stderr backing file.",
+    "",
+    "Generated script options",
+    "--detail-result <path>          Write detailed result report to file.",
+    "",
+    "Editor normal mode",
+    "i insert, :wq save, :q cancel, :template regex templates.",
+    "dd / dNd delete lines, yy / yNy copy lines, p / P paste.",
+    "u undo, gg / G / nG jump, /word search, n / N next/previous."
+};
+
+#define EDITOR_HELP_LINE_COUNT ((int)(sizeof(EDITOR_HELP_LINES) / sizeof(EDITOR_HELP_LINES[0])))
 
 static void write_match_function(FILE *f);
 static void write_case(FILE *f, const TestCase *tc, int index);
@@ -658,6 +699,11 @@ static void write_command_expanded(FILE *f, const char *command) {
             char directive_arg[LONG_LEN];
             if (line_starts_tui(p, len, tui_cmd, sizeof(tui_cmd))) {
                 fputs("if ! command -v script >/dev/null 2>&1; then echo '[NG] missing script command' >&2; exit 1; fi\n", f);
+                fputs("AUTOTEST_TUI_INDEX=$(( ${AUTOTEST_TUI_INDEX:-0} + 1 ))\n", f);
+                fputs("AUTOTEST_TUI_DIR=\"${AUTOTEST_TUI_DIR:-${WORK_DIR:-/tmp}/autotest-tui}\"\n", f);
+                fputs("mkdir -p \"$AUTOTEST_TUI_DIR\"\n", f);
+                fputs("AUTOTEST_TUI_STDOUT_FILE=\"$AUTOTEST_TUI_DIR/tui_${AUTOTEST_TUI_INDEX}.stdout\"\n", f);
+                fputs("AUTOTEST_TUI_STDERR_FILE=\"$AUTOTEST_TUI_DIR/tui_${AUTOTEST_TUI_INDEX}.stderr\"\n", f);
                 fputs("{\n", f);
                 in_tui = true;
             } else if (line_starts_directive(p, len, "@assert", directive_arg, sizeof(directive_arg))) {
@@ -687,7 +733,11 @@ static void write_command_expanded(FILE *f, const char *command) {
             if (line_is_tui_end(p, len)) {
                 fputs("} | script -q -c ", f);
                 shell_quote_len(f, tui_cmd, strlen(tui_cmd));
-                fputs(" /dev/null >/dev/null 2>&1\n", f);
+                fputs(" \"$AUTOTEST_TUI_STDOUT_FILE\" >/dev/null 2>\"$AUTOTEST_TUI_STDERR_FILE\"\n", f);
+                fputs("AUTOTEST_TUI_STATUS=\"$?\"\n", f);
+                fputs("AUTOTEST_TUI_STDOUT=\"$(cat \"$AUTOTEST_TUI_STDOUT_FILE\" 2>/dev/null || true)\"\n", f);
+                fputs("AUTOTEST_TUI_STDERR=\"$(cat \"$AUTOTEST_TUI_STDERR_FILE\" 2>/dev/null || true)\"\n", f);
+                fputs("export AUTOTEST_TUI_STATUS AUTOTEST_TUI_STDOUT AUTOTEST_TUI_STDERR AUTOTEST_TUI_STDOUT_FILE AUTOTEST_TUI_STDERR_FILE\n", f);
                 in_tui = false;
             } else if (line_starts_tui(p, len, tui_cmd, sizeof(tui_cmd))) {
                 fputs("  echo '[NG] nested @tui block' >&2\n  exit 1\n", f);
@@ -701,7 +751,11 @@ static void write_command_expanded(FILE *f, const char *command) {
         fputs("  echo '[NG] missing @end for @tui block' >&2\n  exit 1\n", f);
         fputs("} | script -q -c ", f);
         shell_quote_len(f, tui_cmd, strlen(tui_cmd));
-        fputs(" /dev/null >/dev/null 2>&1\n", f);
+        fputs(" \"$AUTOTEST_TUI_STDOUT_FILE\" >/dev/null 2>\"$AUTOTEST_TUI_STDERR_FILE\"\n", f);
+        fputs("AUTOTEST_TUI_STATUS=\"$?\"\n", f);
+        fputs("AUTOTEST_TUI_STDOUT=\"$(cat \"$AUTOTEST_TUI_STDOUT_FILE\" 2>/dev/null || true)\"\n", f);
+        fputs("AUTOTEST_TUI_STDERR=\"$(cat \"$AUTOTEST_TUI_STDERR_FILE\" 2>/dev/null || true)\"\n", f);
+        fputs("export AUTOTEST_TUI_STATUS AUTOTEST_TUI_STDOUT AUTOTEST_TUI_STDERR AUTOTEST_TUI_STDOUT_FILE AUTOTEST_TUI_STDERR_FILE\n", f);
     }
 }
 
@@ -869,36 +923,91 @@ static void auto_configure_test(TestCase *tc) {
 }
 
 static void make_test_filename(const TestCase *tc, char *out, size_t out_sz) {
-    char safe_id[64];
+    char safe_name[TEXT_LEN];
+    const char *src = tc->title[0] ? tc->title : tc->id;
     size_t j = 0;
-    for (size_t i = 0; tc->id[i] && j + 1 < sizeof(safe_id); i++) {
-        unsigned char c = (unsigned char)tc->id[i];
-        safe_id[j++] = (char)(isalnum(c) ? tolower(c) : '_');
+    bool has_name = false;
+    bool last_underscore = false;
+    for (size_t i = 0; src[i] && j + 1 < sizeof(safe_name); i++) {
+        unsigned char c = (unsigned char)src[i];
+        if (isalnum(c)) {
+            safe_name[j++] = (char)tolower(c);
+            has_name = true;
+            last_underscore = false;
+        } else if (c >= 0x80 || c == '.' || c == '-') {
+            safe_name[j++] = (char)c;
+            has_name = true;
+            last_underscore = false;
+        } else if (c == '_' || isspace(c)) {
+            if (has_name && !last_underscore) {
+                safe_name[j++] = '_';
+                last_underscore = true;
+            }
+        } else if (has_name && !last_underscore) {
+            safe_name[j++] = '_';
+            last_underscore = true;
+        }
     }
-    if (j == 0) {
-        copy_text(safe_id, sizeof(safe_id), "test");
+    while (j > 0 && safe_name[j - 1] == '_') j--;
+    if (!has_name || j == 0) {
+        copy_text(safe_name, sizeof(safe_name), "test");
     } else {
-        safe_id[j] = '\0';
+        safe_name[j] = '\0';
     }
-    snprintf(out, out_sz, "autotest_%s.sh", safe_id);
+    snprintf(out, out_sz, "%s.sh", safe_name);
+}
+
+static void make_result_path(const char *script_path, char *out, size_t out_sz) {
+    copy_text(out, out_sz, script_path);
+    size_t len = strlen(out);
+    if (len > 3 && strcmp(out + len - 3, ".sh") == 0) {
+        snprintf(out + len - 3, out_sz - len + 3, ".result");
+    } else if (len + 8 < out_sz) {
+        strcat(out, ".result");
+    }
+}
+
+static int make_test_path(const TestCase *tc, char *out, size_t out_sz) {
+    char dir[LONG_LEN];
+    char filename[TEXT_LEN];
+    make_test_filename(tc, filename, sizeof(filename));
+    if (tc->script_path[0]) {
+        copy_text(dir, sizeof(dir), tc->script_path);
+        char *slash = strrchr(dir, '/');
+        if (slash) {
+            *slash = '\0';
+        } else {
+            copy_text(dir, sizeof(dir), ".");
+        }
+    } else if (!getcwd(dir, sizeof(dir))) {
+        return -1;
+    }
+    size_t dir_len = strlen(dir);
+    size_t file_len = strlen(filename);
+    if (dir_len + 1 + file_len + 1 > out_sz) return -1;
+    memcpy(out, dir, dir_len);
+    out[dir_len] = '/';
+    memcpy(out + dir_len + 1, filename, file_len + 1);
+    return 0;
+}
+
+static bool title_path_conflicts(const TestCase *tc, const char *title) {
+    TestCase tmp = *tc;
+    char path[LONG_LEN];
+    copy_text(tmp.title, sizeof(tmp.title), title);
+    if (make_test_path(&tmp, path, sizeof(path)) != 0) return false;
+    if (tmp.script_path[0] && strcmp(tmp.script_path, path) == 0) return false;
+    return access(path, F_OK) == 0;
 }
 
 static int write_single_test_script(TestCase *tc) {
     auto_configure_test(tc);
-    char cwd[LONG_LEN];
-    char filename[TEXT_LEN];
     char path[LONG_LEN];
-    if (tc->script_path[0]) {
-        copy_text(path, sizeof(path), tc->script_path);
-    } else {
-        if (!getcwd(cwd, sizeof(cwd))) return -1;
-        make_test_filename(tc, filename, sizeof(filename));
-        size_t cwd_len = strlen(cwd);
-        size_t file_len = strlen(filename);
-        if (cwd_len + 1 + file_len + 1 > sizeof(path)) return -1;
-        memcpy(path, cwd, cwd_len);
-        path[cwd_len] = '/';
-        memcpy(path + cwd_len + 1, filename, file_len + 1);
+    char old_path[LONG_LEN];
+    copy_text(old_path, sizeof(old_path), tc->script_path);
+    if (make_test_path(tc, path, sizeof(path)) != 0) return -1;
+    if ((!old_path[0] || strcmp(old_path, path) != 0) && access(path, F_OK) == 0) {
+        return -2;
     }
 
     FILE *f = fopen(path, "w");
@@ -910,6 +1019,17 @@ static int write_single_test_script(TestCase *tc) {
     fprintf(f, "NG_COUNT=0\n\n");
     fprintf(f, "SELF_PATH=\"$(readlink -f \"$0\" 2>/dev/null || printf '%%s\\n' \"$0\")\"\n");
     fprintf(f, "RESULT_FILE=\"${SELF_PATH%%.sh}.result\"\n\n");
+    fprintf(f, "MODE=run\n");
+    fprintf(f, "DETAIL_RESULT_FILE=\"\"\n");
+    fprintf(f, "while [ \"$#\" -gt 0 ]; do\n");
+    fprintf(f, "  case \"$1\" in\n");
+    fprintf(f, "    --resume) MODE=--resume; shift ;;\n");
+    fprintf(f, "    --detail-result) shift; if [ \"$#\" -eq 0 ]; then echo '[NG] --detail-result requires a path' >&2; exit 2; fi; DETAIL_RESULT_FILE=\"$1\"; shift ;;\n");
+    fprintf(f, "    --detail-result=*) DETAIL_RESULT_FILE=\"${1#--detail-result=}\"; shift ;;\n");
+    fprintf(f, "    --help) echo \"Usage: $0 [--detail-result PATH]\"; echo \"       $0 --resume\"; exit 0 ;;\n");
+    fprintf(f, "    *) MODE=\"$1\"; shift ;;\n");
+    fprintf(f, "  esac\n");
+    fprintf(f, "done\n\n");
     fprintf(f, "WORK_DIR=\"${TMPDIR:-/tmp}/autotest-single.$$\"\n");
     fprintf(f, "mkdir -p \"$WORK_DIR\"\n");
     fprintf(f, "AUTOTEST_BACKUP_DIR=\"$WORK_DIR/backups\"\n");
@@ -920,10 +1040,16 @@ static int write_single_test_script(TestCase *tc) {
     fprintf(f, "}\ntrap cleanup EXIT\n\n");
     write_match_function(f);
     write_case(f, tc, 0);
-    fprintf(f, "run_case_001 \"${1:-run}\"\n");
+    fprintf(f, "run_case_001 \"$MODE\"\n");
     write_summary(f);
     fclose(f);
     chmod(path, 0755);
+    if (old_path[0] && strcmp(old_path, path) != 0) {
+        char old_result[LONG_LEN];
+        unlink(old_path);
+        make_result_path(old_path, old_result, sizeof(old_result));
+        unlink(old_result);
+    }
     copy_text(tc->script_path, sizeof(tc->script_path), path);
     return 0;
 }
@@ -932,6 +1058,8 @@ static void open_text_editor(App *app, EditorTarget target, Screen return_screen
     app->editor_target = target;
     app->previous_screen = return_screen;
     app->regex_template_list_open = false;
+    app->editor_help_open = false;
+    app->editor_help_scroll = 0;
     load_editor_from_case(app);
     app->screen = SCREEN_SCRIPT_EDITOR;
     app->selected_menu = 0;
@@ -1234,8 +1362,8 @@ static void draw_editor(const App *app, int height, int width) {
     if (has_reboot(&app->project)) {
         mvprintw(bottom + 2, 1, "selected reboot tests may interrupt sequential execution");
     }
-    static const char *menu[] = {"Edit test", "Select test", "Delete test", "Variable match", "Preview selected", "Start selected tests", "Back"};
-    draw_menu(height - 4, 1, width - 2, menu, 7, app->selected_menu);
+    static const char *menu[] = {"Edit test", "Rename test", "Select test", "Delete test", "Variable match", "Preview selected", "Start selected tests", "Back"};
+    draw_menu(height - 4, 1, width - 2, menu, 8, app->selected_menu);
 }
 
 static void draw_form(const App *app, int height, int width) {
@@ -1317,6 +1445,49 @@ static void draw_reboot(const App *app, int height, int width) {
     draw_menu(height - 4, 1, width - 2, menu, 3, app->selected_menu);
 }
 
+static void draw_editor_help(const App *app, int height, int width) {
+    int box_w = width - 10;
+    if (box_w > 92) box_w = 92;
+    if (box_w < 40) box_w = width - 2;
+    int box_h = EDITOR_HELP_LINE_COUNT + 4;
+    if (box_h > height - 4) box_h = height - 4;
+    if (box_h < 8) box_h = 8;
+    int y = (height - box_h) / 2;
+    int x = (width - box_w) / 2;
+    if (x < 0) x = 0;
+    for (int row = 0; row < box_h; row++) {
+        mvhline(y + row, x, ' ', box_w);
+    }
+    draw_box(y, x, box_h, box_w, "Editor Help");
+    int rows = box_h - 3;
+    int max_scroll = EDITOR_HELP_LINE_COUNT > rows ? EDITOR_HELP_LINE_COUNT - rows : 0;
+    int scroll = app->editor_help_scroll;
+    if (scroll < 0) scroll = 0;
+    if (scroll > max_scroll) scroll = max_scroll;
+    for (int i = 0; i < rows; i++) {
+        int line_index = scroll + i;
+        if (line_index >= EDITOR_HELP_LINE_COUNT) {
+            print_clip(y + 1 + i, x + 2, box_w - 4, "");
+            continue;
+        }
+        const char *line = EDITOR_HELP_LINES[line_index];
+        if (line[0] && line[0] != ' ' &&
+            strcmp(line, EDITOR_HELP_LINES[0]) != 0 &&
+            strchr(line, '<') == NULL &&
+            strchr(line, '/') == NULL &&
+            strchr(line, ':') == NULL) {
+            attron(A_BOLD);
+            print_clip(y + 1 + i, x + 2, box_w - 4, line);
+            attroff(A_BOLD);
+        } else {
+            print_clip(y + 1 + i, x + 2, box_w - 4, line);
+        }
+    }
+    if (max_scroll > 0) {
+        mvprintw(y + box_h - 2, x + box_w - 18, " %2d/%2d ", scroll + 1, max_scroll + 1);
+    }
+}
+
 static void draw_script_editor(const App *app, int height, int width) {
     draw_header(app, width);
     char title[TEXT_LEN];
@@ -1340,14 +1511,14 @@ static void draw_script_editor(const App *app, int height, int width) {
         mvhline(height - 5, 1, ' ', width - 2);
         mvprintw(height - 5, 2, "Regex templates: :template");
     }
-    mvprintw(height - 4, 2, "-- %s --  Arrow move  i insert  Esc normal  :wq save  :q cancel",
+    mvprintw(height - 4, 2, "-- %s --  Arrow move  i insert  Esc normal  :wq save  :q cancel  :help",
              app->editor_insert ? "INSERT" : "NORMAL");
     if (!app->editor_insert && app->editor_command_mode) {
         mvprintw(height - 3, 2, ":%s", app->editor_command);
     } else if (!app->editor_insert && app->editor_search_mode) {
         mvprintw(height - 3, 2, "/%s", app->editor_search);
     } else {
-        mvprintw(height - 3, 2, "Editing %s.", editor_target_name(app->editor_target));
+        mvprintw(height - 3, 2, "Editing %s.  :help shows custom commands.", editor_target_name(app->editor_target));
     }
     if (regex_templates && app->regex_template_list_open) {
         int box_h = REGEX_TEMPLATE_COUNT + 4;
@@ -1370,6 +1541,9 @@ static void draw_script_editor(const App *app, int height, int width) {
                      REGEX_TEMPLATES[i].text);
             if (i == app->selected_menu) attroff(A_REVERSE);
         }
+    }
+    if (app->editor_help_open) {
+        draw_editor_help(app, height, width);
     }
     if (app->editor_insert) {
         int cy = 6 + app->editor_row;
@@ -1855,26 +2029,62 @@ static void handle_script_editor_key(App *app, int ch) {
         return;
     }
 
+    if (app->editor_help_open) {
+        if (ch == 27 || ch == '\n' || ch == KEY_ENTER || ch == 'q') {
+            app->editor_help_open = false;
+            set_status(app, "Closed editor help.");
+        } else {
+            int box_h = EDITOR_HELP_LINE_COUNT + 4;
+            if (box_h > LINES - 4) box_h = LINES - 4;
+            if (box_h < 8) box_h = 8;
+            int rows = box_h - 3;
+            int max_scroll = EDITOR_HELP_LINE_COUNT > rows ? EDITOR_HELP_LINE_COUNT - rows : 0;
+            if (ch == KEY_DOWN || ch == 'j') {
+                if (app->editor_help_scroll < max_scroll) app->editor_help_scroll++;
+            } else if (ch == KEY_UP || ch == 'k') {
+                if (app->editor_help_scroll > 0) app->editor_help_scroll--;
+            } else if (ch == KEY_NPAGE) {
+                app->editor_help_scroll += rows;
+                if (app->editor_help_scroll > max_scroll) app->editor_help_scroll = max_scroll;
+            } else if (ch == KEY_PPAGE) {
+                app->editor_help_scroll -= rows;
+                if (app->editor_help_scroll < 0) app->editor_help_scroll = 0;
+            } else if (ch == KEY_HOME || ch == 'g') {
+                app->editor_help_scroll = 0;
+            } else if (ch == KEY_END || ch == 'G') {
+                app->editor_help_scroll = max_scroll;
+            }
+        }
+        return;
+    }
+
     if (app->editor_command_mode) {
         if (ch == '\n' || ch == KEY_ENTER) {
             app->editor_command[app->editor_command_len] = '\0';
             if (strcmp(app->editor_command, "wq") == 0) {
                 save_editor_to_case(app);
-                if (app->editor_target == EDIT_TARGET_COMMAND &&
-                    write_single_test_script(&app->project.cases[app->selected_case]) == 0) {
-                    save_test_registry(&app->project);
-                    set_status(app, "Saved test script in current directory.");
+                if (app->editor_target == EDIT_TARGET_COMMAND) {
+                    int rc = write_single_test_script(&app->project.cases[app->selected_case]);
+                    if (rc == 0) {
+                        save_test_registry(&app->project);
+                        set_status(app, "Saved test script.");
+                        app->editor_new_case = false;
+                        app->screen = app->previous_screen;
+                    } else if (rc == -2) {
+                        set_status(app, "Script name already exists in this directory.");
+                    } else {
+                        set_status(app, "Failed to save test script.");
+                    }
                 } else if (app->editor_target != EDIT_TARGET_COMMAND) {
                     if (app->project.cases[app->selected_case].script_path[0]) {
                         write_single_test_script(&app->project.cases[app->selected_case]);
                     }
                     save_test_registry(&app->project);
                     set_status(app, "Saved variable expectation.");
+                    app->screen = app->previous_screen;
                 } else {
                     set_status(app, "Failed to save test script.");
                 }
-                if (app->editor_target == EDIT_TARGET_COMMAND) app->editor_new_case = false;
-                app->screen = app->previous_screen;
             } else if (strcmp(app->editor_command, "q") == 0) {
                 if (app->editor_target == EDIT_TARGET_COMMAND) discard_current_case_if_new(app);
                 app->screen = app->previous_screen;
@@ -1883,6 +2093,11 @@ static void handle_script_editor_key(App *app, int ch) {
                 app->regex_template_list_open = true;
                 app->selected_menu = 0;
                 set_status(app, "Opened regex templates.");
+            } else if (strcmp(app->editor_command, "help") == 0) {
+                app->editor_help_open = true;
+                app->editor_help_scroll = 0;
+                app->regex_template_list_open = false;
+                set_status(app, "Opened editor help.");
             } else {
                 set_status(app, "Unknown editor command.");
             }
@@ -2044,22 +2259,30 @@ static void add_case(App *app) {
         set_status(app, "Maximum test cases reached.");
         return;
     }
-    TestCase *tc = &app->project.cases[app->project.case_count];
-    memset(tc, 0, sizeof(*tc));
-    snprintf(tc->id, sizeof(tc->id), "TC%03d", app->project.case_count + 1);
-    snprintf(tc->title, sizeof(tc->title), "new test case");
-    snprintf(tc->command, sizeof(tc->command), "true");
-    tc->kind = CMD_SHELL;
-    tc->selected = true;
-    tc->expected_exit = 0;
-    tc->check_count = 1;
-    copy_text(tc->checks[0].var, sizeof(tc->checks[0].var), "AUTOTEST_ACTUAL");
-    tc->checks[0].match = MATCH_NONE;
-    tc->timeout_sec = 30;
+    TestCase new_case;
+    memset(&new_case, 0, sizeof(new_case));
+    snprintf(new_case.id, sizeof(new_case.id), "TC%03d", app->project.case_count + 1);
+    snprintf(new_case.title, sizeof(new_case.title), "new test case");
+    snprintf(new_case.command, sizeof(new_case.command), "true");
+    new_case.kind = CMD_SHELL;
+    new_case.selected = true;
+    new_case.expected_exit = 0;
+    new_case.check_count = 1;
+    copy_text(new_case.checks[0].var, sizeof(new_case.checks[0].var), "AUTOTEST_ACTUAL");
+    new_case.checks[0].match = MATCH_NONE;
+    new_case.timeout_sec = 30;
+    if (!prompt_text("test title", new_case.title, sizeof(new_case.title))) {
+        set_status(app, "Canceled test title.");
+        return;
+    }
+    if (title_path_conflicts(&new_case, new_case.title)) {
+        set_status(app, "Script name already exists in this directory.");
+        return;
+    }
     app->selected_case = app->project.case_count;
+    app->project.cases[app->project.case_count] = new_case;
     app->project.case_count++;
     app->editor_new_case = true;
-    prompt_text("test title", tc->title, sizeof(tc->title));
     open_script_editor(app);
     app->selected_field = 1;
     set_status(app, "Added a test case.");
@@ -2075,13 +2298,7 @@ static void delete_case(App *app) {
     result_path[0] = '\0';
     if (deleted_path[0]) {
         unlink_rc = unlink(deleted_path);
-        copy_text(result_path, sizeof(result_path), deleted_path);
-        size_t len = strlen(result_path);
-        if (len > 3 && strcmp(result_path + len - 3, ".sh") == 0) {
-            snprintf(result_path + len - 3, sizeof(result_path) - len + 3, ".result");
-        } else if (len + 8 < sizeof(result_path)) {
-            strcat(result_path, ".result");
-        }
+        make_result_path(deleted_path, result_path, sizeof(result_path));
         result_unlink_rc = unlink(result_path);
     }
     for (int i = app->selected_case; i < app->project.case_count - 1; i++) {
@@ -2097,12 +2314,50 @@ static void delete_case(App *app) {
     }
 }
 
+static void rename_case(App *app) {
+    if (app->project.case_count == 0) return;
+    TestCase *tc = &app->project.cases[app->selected_case];
+    char old_title[TEXT_LEN];
+    copy_text(old_title, sizeof(old_title), tc->title);
+    if (!prompt_text("test title", tc->title, sizeof(tc->title))) {
+        set_status(app, "Canceled test rename.");
+        return;
+    }
+    if (title_path_conflicts(tc, tc->title)) {
+        copy_text(tc->title, sizeof(tc->title), old_title);
+        set_status(app, "Script name already exists in this directory.");
+        return;
+    }
+    int rc = write_single_test_script(tc);
+    if (rc == 0) {
+        save_test_registry(&app->project);
+        set_status(app, "Renamed test.");
+    } else if (rc == -2) {
+        copy_text(tc->title, sizeof(tc->title), old_title);
+        set_status(app, "Script name already exists in this directory.");
+    } else {
+        copy_text(tc->title, sizeof(tc->title), old_title);
+        set_status(app, "Failed to rename test.");
+    }
+}
+
 static void edit_selected_field(App *app) {
     if (app->project.case_count == 0) return;
     TestCase *tc = &app->project.cases[app->selected_case];
     switch (app->selected_field) {
     case 0: prompt_text("id", tc->id, sizeof(tc->id)); break;
-    case 1: prompt_text("title", tc->title, sizeof(tc->title)); break;
+    case 1: {
+        char old_title[TEXT_LEN];
+        copy_text(old_title, sizeof(old_title), tc->title);
+        if (prompt_text("title", tc->title, sizeof(tc->title))) {
+            if (title_path_conflicts(tc, tc->title)) {
+                copy_text(tc->title, sizeof(tc->title), old_title);
+                set_status(app, "Script name already exists in this directory.");
+                return;
+            }
+        }
+        break;
+    }
     case 2: tc->selected = !tc->selected; break;
     case 3: cycle_kind(tc); break;
     case 4: prompt_text("command", tc->command, sizeof(tc->command)); tc->kind = CMD_SHELL; break;
@@ -2155,6 +2410,35 @@ static void write_match_function(FILE *f) {
     fputs("  dest=\"$AUTOTEST_BACKUP_DIR/$key\"\n", f);
     fputs("  [ -d \"$dest\" ] || return 0\n", f);
     fputs("  if [ \"$(cat \"$dest/exists\" 2>/dev/null || echo 0)\" = 1 ]; then rm -rf \"$path\"; cp -a \"$dest/item\" \"$path\"; else rm -rf \"$path\"; fi\n", f);
+    fputs("}\n\n", f);
+    fputs("autotest_write_detail_result() {\n", f);
+    fputs("  detail_file=\"$1\"\n", f);
+    fputs("  [ -n \"$detail_file\" ] || return 0\n", f);
+    fputs("  detail_dir=$(dirname \"$detail_file\" 2>/dev/null || echo .)\n", f);
+    fputs("  mkdir -p \"$detail_dir\" 2>/dev/null || true\n", f);
+    fputs("  {\n", f);
+    fputs("    echo \"${status_msg-}\"\n", f);
+    fputs("    echo \"Summary: total=$TOTAL_COUNT OK=$OK_COUNT NG=$NG_COUNT\"\n", f);
+    fputs("    echo \"expected_exit=${expected_exit-}\"\n", f);
+    fputs("    echo \"actual_exit=${actual_exit-}\"\n", f);
+    fputs("    echo \"ok=${ok-}\"\n", f);
+    fputs("    echo \"check_count=${check_count:-0}\"\n", f);
+    fputs("    i=1\n", f);
+    fputs("    while [ \"$i\" -le \"${check_count:-0}\" ]; do\n", f);
+    fputs("      eval \"name=\\${check_var_$i-}\"\n", f);
+    fputs("      eval \"value=\\${actual_value_$i-}\"\n", f);
+    fputs("      echo \"check_$i=$name\"\n", f);
+    fputs("      echo \"actual_$i=$value\"\n", f);
+    fputs("      i=$((i + 1))\n", f);
+    fputs("    done\n", f);
+    fputs("    echo \"actual_dir=${actual_dir-}\"\n", f);
+    fputs("    echo \"stdout_file=${stdout_file-}\"\n", f);
+    fputs("    echo \"stderr_file=${stderr_file-}\"\n", f);
+    fputs("    echo '--- stdout ---'\n", f);
+    fputs("    [ -n \"${stdout_file-}\" ] && [ -f \"$stdout_file\" ] && cat \"$stdout_file\"\n", f);
+    fputs("    echo '--- stderr ---'\n", f);
+    fputs("    [ -n \"${stderr_file-}\" ] && [ -f \"$stderr_file\" ] && cat \"$stderr_file\"\n", f);
+    fputs("  } >\"$detail_file\"\n", f);
     fputs("}\n\n", f);
 }
 
@@ -2215,6 +2499,7 @@ static void write_case(FILE *f, const TestCase *tc, int index) {
 
     fprintf(f, "run_case_%03d() {\n", index + 1);
     fprintf(f, "  TOTAL_COUNT=$((TOTAL_COUNT + 1))\n");
+    fprintf(f, "  expected_exit=%d\n", tc->expected_exit);
     if (tc->kind == CMD_REBOOT) {
         fprintf(f, "  mode=\"${1:-run}\"\n");
         fprintf(f, "  state_dir=\"/var/tmp/autotest-%s-state\"\n", safe_id);
@@ -2260,12 +2545,18 @@ static void write_case(FILE *f, const TestCase *tc, int index) {
         fprintf(f, "      echo '--- stderr ---'\n");
         fprintf(f, "      [ -f \"$stderr_file\" ] && cat \"$stderr_file\"\n");
         fprintf(f, "    } >\"$RESULT_FILE\"\n");
+        fprintf(f, "    autotest_write_detail_result \"$DETAIL_RESULT_FILE\"\n");
         fprintf(f, "    rm -rf \"$state_dir\"\n");
         write_rescue_continue(f, "    ");
         fprintf(f, "  }\n");
         fprintf(f, "  mkdir -p \"$state_dir\"\n");
         fprintf(f, "  mkdir -p \"$actual_dir\"\n");
         fprintf(f, "  mkdir -p \"$AUTOTEST_BACKUP_DIR\"\n");
+        fprintf(f, "  if [ \"$mode\" = \"--resume\" ]; then\n");
+        fprintf(f, "    [ -f \"$state_dir/detail_result_path\" ] && DETAIL_RESULT_FILE=$(cat \"$state_dir/detail_result_path\" 2>/dev/null || true)\n");
+        fprintf(f, "  elif [ -n \"$DETAIL_RESULT_FILE\" ]; then\n");
+        fprintf(f, "    printf '%%s\\n' \"$DETAIL_RESULT_FILE\" >\"$state_dir/detail_result_path\"\n");
+        fprintf(f, "  fi\n");
         fprintf(f, "  cat >\"$state_dir/pre.sh\" <<'AUTOTEST_PRE'\n");
         write_command_phase(f, tc->command, false);
         fprintf(f, "AUTOTEST_PRE\n");
@@ -2301,7 +2592,7 @@ static void write_case(FILE *f, const TestCase *tc, int index) {
         fprintf(f, "  systemctl enable \"$unit_name\"\n");
         fprintf(f, "  bash \"$state_dir/reboot.sh\" >>\"$stdout_file\" 2>>\"$stderr_file\"\n");
         fprintf(f, "  reboot_exit=\"$?\"\n");
-        fprintf(f, "  if [ \"$reboot_exit\" -eq 0 ]; then echo '[PENDING] Reboot command issued. Result check will resume after boot.' >\"$RESULT_FILE\"; echo 'Reboot command issued. Result check will resume after boot.'; exit 0; fi\n");
+        fprintf(f, "  if [ \"$reboot_exit\" -eq 0 ]; then status_msg='[PENDING] Reboot command issued. Result check will resume after boot.'; actual_exit=0; ok=0; check_count=0; echo \"$status_msg\" >\"$RESULT_FILE\"; autotest_write_detail_result \"$DETAIL_RESULT_FILE\"; echo 'Reboot command issued. Result check will resume after boot.'; exit 0; fi\n");
         fprintf(f, "  if [ \"$reboot_exit\" -eq 125 ]; then\n");
         fprintf(f, "    ( set -a; [ -f \"$state_dir/env.sh\" ] && . \"$state_dir/env.sh\"; . \"$state_dir/post.sh\"; post_rc=\"$?\"; ");
         write_capture_checks(f, tc, "", "$actual_dir");
@@ -2330,19 +2621,22 @@ static void write_case(FILE *f, const TestCase *tc, int index) {
     fprintf(f, "  [ \"$actual_exit\" -eq %d ] || ok=0\n", tc->expected_exit);
     write_validate_checks(f, tc, "  ", "$actual_dir");
     fprintf(f, "  if [ \"$ok\" -eq 1 ]; then\n");
-    fprintf(f, "    echo ");
+    fprintf(f, "    status_msg=");
     shell_quote(f, ok_msg);
     fprintf(f, "\n");
+    fprintf(f, "    echo \"$status_msg\"\n");
     fprintf(f, "    OK_COUNT=$((OK_COUNT + 1))\n");
     fprintf(f, "  else\n");
-    fprintf(f, "    echo ");
+    fprintf(f, "    status_msg=");
     shell_quote(f, ng_prefix);
     fprintf(f, "\"$actual_exit\"\n");
+    fprintf(f, "    echo \"$status_msg\"\n");
     fprintf(f, "    echo \"     actual: $actual_dir\"\n");
     fprintf(f, "    echo \"     stdout: $stdout_file\"\n");
     fprintf(f, "    echo \"     stderr: $stderr_file\"\n");
     fprintf(f, "    NG_COUNT=$((NG_COUNT + 1))\n");
     fprintf(f, "  fi\n");
+    fprintf(f, "  autotest_write_detail_result \"$DETAIL_RESULT_FILE\"\n");
     if (tc->cleanup[0]) fprintf(f, "  %s || true\n", tc->cleanup);
     fprintf(f, "}\n\n");
 }
@@ -2626,22 +2920,35 @@ static void run_selected_menu(App *app) {
         break;
     case SCREEN_EDITOR:
         if (app->selected_menu == 0 && app->project.case_count) { app->editor_new_case = false; open_script_editor(app); }
-        else if (app->selected_menu == 1 && app->project.case_count) { app->project.cases[app->selected_case].selected = !app->project.cases[app->selected_case].selected; save_test_registry(&app->project); }
-        else if (app->selected_menu == 2) delete_case(app);
-        else if (app->selected_menu == 3) { app->screen = SCREEN_MATCH; app->selected_menu = 0; }
-        else if (app->selected_menu == 4) { app->selected_only = true; preview_script(app); app->screen = SCREEN_PREVIEW; app->selected_menu = 0; }
-        else if (app->selected_menu == 5) {
+        else if (app->selected_menu == 1 && app->project.case_count) rename_case(app);
+        else if (app->selected_menu == 2 && app->project.case_count) { app->project.cases[app->selected_case].selected = !app->project.cases[app->selected_case].selected; save_test_registry(&app->project); }
+        else if (app->selected_menu == 3) delete_case(app);
+        else if (app->selected_menu == 4) { app->screen = SCREEN_MATCH; app->selected_menu = 0; }
+        else if (app->selected_menu == 5) { app->selected_only = true; preview_script(app); app->screen = SCREEN_PREVIEW; app->selected_menu = 0; }
+        else if (app->selected_menu == 6) {
             if (selected_count(&app->project) == 0) set_status(app, "Select at least one test before starting.");
             else { app->selected_only = true; app->run_after_generate = true; app->previous_screen = app->screen; app->screen = SCREEN_CONFIRM; app->selected_menu = 0; }
         }
-        else if (app->selected_menu == 6) { app->screen = SCREEN_DASHBOARD; app->selected_menu = 0; }
+        else if (app->selected_menu == 7) { app->screen = SCREEN_DASHBOARD; app->selected_menu = 0; }
         break;
     case SCREEN_FORM:
         if (app->selected_menu == 0 || app->selected_menu == 1) edit_selected_field(app);
         else if (app->selected_menu == 2 && app->project.case_count) { app->project.cases[app->selected_case].kind = CMD_SHELL; prompt_text("shell command", app->project.cases[app->selected_case].command, sizeof(app->project.cases[app->selected_case].command)); }
         else if (app->selected_menu == 3 && app->project.case_count) set_reboot_command(&app->project.cases[app->selected_case]);
         else if (app->selected_menu == 4 && app->project.case_count) set_vim_command(&app->project.cases[app->selected_case]);
-        else if (app->selected_menu == 5) { app->screen = SCREEN_EDITOR; app->selected_menu = 0; set_status(app, "Saved test."); }
+        else if (app->selected_menu == 5) {
+            int rc = write_single_test_script(&app->project.cases[app->selected_case]);
+            if (rc == 0) {
+                save_test_registry(&app->project);
+                app->screen = SCREEN_EDITOR;
+                app->selected_menu = 0;
+                set_status(app, "Saved test.");
+            } else if (rc == -2) {
+                set_status(app, "Script name already exists in this directory.");
+            } else {
+                set_status(app, "Failed to save test.");
+            }
+        }
         else if (app->selected_menu == 6) { app->screen = SCREEN_EDITOR; app->selected_menu = 0; }
         break;
     case SCREEN_MATCH:
@@ -2721,7 +3028,7 @@ static void run_selected_menu(App *app) {
 static int menu_count_for(Screen s) {
     switch (s) {
     case SCREEN_DASHBOARD: return 5;
-    case SCREEN_EDITOR: return 7;
+    case SCREEN_EDITOR: return 8;
     case SCREEN_FORM: return 7;
     case SCREEN_MATCH: return 4;
     case SCREEN_CLEANUP: return 6;

@@ -171,6 +171,41 @@ test_reboot_if_false_branch() {
   [ "$rc" -eq 125 ]
 }
 
+test_title_filename_source() {
+  grep -Fq 'const char *src = tc->title[0] ? tc->title : tc->id' "$SRC" &&
+  grep -Fq 'snprintf(out, out_sz, "%s.sh", safe_name)' "$SRC" &&
+  ! grep -Fq 'snprintf(out, out_sz, "autotest_%s.sh", safe_name)' "$SRC"
+}
+
+test_script_name_collision_source() {
+  grep -Fq 'title_path_conflicts' "$SRC" &&
+  grep -Fq 'access(path, F_OK) == 0' "$SRC" &&
+  grep -Fq 'return -2' "$SRC" &&
+  grep -Fq 'Script name already exists in this directory.' "$SRC" &&
+  grep -Fq 'if (title_path_conflicts(&new_case, new_case.title))' "$SRC" &&
+  grep -Fq 'if (title_path_conflicts(tc, tc->title))' "$SRC"
+}
+
+test_script_rename_source() {
+  grep -Fq 'Rename test' "$SRC" &&
+  grep -Fq 'rename_case' "$SRC" &&
+  grep -Fq 'make_test_path(tc, path, sizeof(path))' "$SRC" &&
+  grep -Fq 'strcmp(old_path, path) != 0' "$SRC" &&
+  grep -Fq 'unlink(old_path)' "$SRC" &&
+  grep -Fq 'make_result_path(old_path' "$SRC"
+}
+
+test_detail_result_source() {
+  grep -Fq -- '--detail-result' "$SRC" &&
+  grep -Fq 'DETAIL_RESULT_FILE' "$SRC" &&
+  grep -Fq 'autotest_write_detail_result' "$SRC" &&
+  grep -Fq 'detail_result_path' "$SRC" &&
+  grep -Fq 'run_case_001 \"$MODE\"' "$SRC" &&
+  grep -Fq 'expected_exit=${expected_exit-}' "$SRC" &&
+  grep -Fq -- '--- stdout ---' "$SRC" &&
+  grep -Fq -- '--- stderr ---' "$SRC"
+}
+
 test_check_directive_source() {
   grep -Fq '@check' "$SRC" &&
   grep -Fq 'MAX_CHECKS' "$SRC" &&
@@ -202,12 +237,27 @@ test_tui_source() {
   grep -Fq 'invalid ctrl key' "$SRC"
 }
 
+test_tui_capture_source() {
+  grep -Fq 'AUTOTEST_TUI_STDOUT_FILE' "$SRC" &&
+  grep -Fq 'AUTOTEST_TUI_STDERR_FILE' "$SRC" &&
+  grep -Fq 'AUTOTEST_TUI_STDOUT=' "$SRC" &&
+  grep -Fq 'cat \"$AUTOTEST_TUI_STDOUT_FILE\"' "$SRC" &&
+  grep -Fq 'AUTOTEST_TUI_STDERR=' "$SRC" &&
+  grep -Fq 'cat \"$AUTOTEST_TUI_STDERR_FILE\"' "$SRC" &&
+  grep -Fq 'AUTOTEST_TUI_STATUS=' "$SRC"
+}
+
 test_editor_source() {
   grep -Fq 'editor_undo' "$SRC" &&
   grep -Fq 'editor_copy_lines' "$SRC" &&
   grep -Fq 'editor_paste_lines' "$SRC" &&
   grep -Fq 'editor_search_next' "$SRC" &&
-  grep -Fq 'editor_goto_line' "$SRC"
+  grep -Fq 'editor_goto_line' "$SRC" &&
+  grep -Fq 'editor_help_open' "$SRC" &&
+  grep -Fq 'editor_help_scroll' "$SRC" &&
+  grep -Fq 'strcmp(app->editor_command, "help")' "$SRC" &&
+  grep -Fq 'ch == KEY_DOWN' "$SRC" &&
+  grep -Fq 'ch == KEY_UP' "$SRC"
 }
 
 test_registry_source() {
@@ -231,6 +281,10 @@ test_docs_limitations() {
 printf 'Running AutoTest Assist feature tests from %s\n' "$ROOT_DIR"
 
 run_case 'build autotest-builder' test_build
+run_case 'title-based script filename source support' test_title_filename_source
+run_case 'script name collision source support' test_script_name_collision_source
+run_case 'script rename source support' test_script_rename_source
+run_case 'detail result option source support' test_detail_result_source
 run_case 'variable match types' test_match_value
 run_case 'multiple variable checks pass' test_multiple_checks_all_pass
 run_case 'multiple variable checks fail as AND' test_multiple_checks_one_fails
@@ -244,6 +298,7 @@ run_case '@assert source support' test_assert_directive_source
 run_case '@backup/@restore source support' test_backup_restore_source
 run_case '@reboot-if source support' test_reboot_if_source
 run_case '@tui source support' test_tui_source
+run_case '@tui output capture source support' test_tui_capture_source
 run_case 'editor command source support' test_editor_source
 run_case 'registry source support' test_registry_source
 run_case 'delete test source support' test_delete_source
