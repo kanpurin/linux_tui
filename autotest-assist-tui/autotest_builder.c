@@ -169,13 +169,17 @@ static const char *EDITOR_HELP_LINES[] = {
     "",
     "TUI output variables",
     "AUTOTEST_TUI_STDOUT             Last pseudo-terminal transcript.",
+    "AUTOTEST_TUI_TEXT               ANSI/control-stripped TUI text.",
     "AUTOTEST_TUI_STDERR             Last script-wrapper stderr.",
     "AUTOTEST_TUI_STATUS             Last script-wrapper exit status.",
     "AUTOTEST_TUI_STDOUT_FILE        Transcript backing file.",
+    "AUTOTEST_TUI_TEXT_FILE          Clean text backing file.",
     "AUTOTEST_TUI_STDERR_FILE        Stderr backing file.",
     "",
     "Generated script options",
     "--detail-result <path>          Write detailed result report to file.",
+    "--help                          Show generated script usage.",
+    "unknown option                  Show usage and exit with error.",
     "",
     "Editor normal mode",
     "i insert, :wq save, :q cancel, :template regex templates.",
@@ -194,6 +198,7 @@ static void save_test_registry(const Project *p);
 static bool command_looks_like_reboot(const char *cmd);
 static void trim_line_copy(char *dst, size_t dst_sz, const char *line, size_t len);
 static void copy_text(char *dst, size_t dst_sz, const char *src);
+static void sync_primary_check_directive(TestCase *tc);
 
 static const char *match_name(MatchType m) {
     switch (m) {
@@ -510,6 +515,7 @@ static void save_editor_to_case(App *app) {
     if (app->editor_target == EDIT_TARGET_CHECK_EXPECTED) {
         CheckRule *check = primary_check(tc);
         save_editor_text(app, check->expected, sizeof(check->expected));
+        sync_primary_check_directive(tc);
     } else {
         save_editor_text(app, tc->command, sizeof(tc->command));
         tc->kind = CMD_SHELL;
@@ -704,6 +710,7 @@ static void write_command_expanded(FILE *f, const char *command) {
                 fputs("mkdir -p \"$AUTOTEST_TUI_DIR\"\n", f);
                 fputs("AUTOTEST_TUI_STDOUT_FILE=\"$AUTOTEST_TUI_DIR/tui_${AUTOTEST_TUI_INDEX}.stdout\"\n", f);
                 fputs("AUTOTEST_TUI_STDERR_FILE=\"$AUTOTEST_TUI_DIR/tui_${AUTOTEST_TUI_INDEX}.stderr\"\n", f);
+                fputs("AUTOTEST_TUI_TEXT_FILE=\"$AUTOTEST_TUI_DIR/tui_${AUTOTEST_TUI_INDEX}.text\"\n", f);
                 fputs("{\n", f);
                 in_tui = true;
             } else if (line_starts_directive(p, len, "@assert", directive_arg, sizeof(directive_arg))) {
@@ -735,9 +742,11 @@ static void write_command_expanded(FILE *f, const char *command) {
                 shell_quote_len(f, tui_cmd, strlen(tui_cmd));
                 fputs(" \"$AUTOTEST_TUI_STDOUT_FILE\" >/dev/null 2>\"$AUTOTEST_TUI_STDERR_FILE\"\n", f);
                 fputs("AUTOTEST_TUI_STATUS=\"$?\"\n", f);
+                fputs("autotest_clean_tui_output \"$AUTOTEST_TUI_STDOUT_FILE\" \"$AUTOTEST_TUI_TEXT_FILE\"\n", f);
                 fputs("AUTOTEST_TUI_STDOUT=\"$(cat \"$AUTOTEST_TUI_STDOUT_FILE\" 2>/dev/null || true)\"\n", f);
                 fputs("AUTOTEST_TUI_STDERR=\"$(cat \"$AUTOTEST_TUI_STDERR_FILE\" 2>/dev/null || true)\"\n", f);
-                fputs("export AUTOTEST_TUI_STATUS AUTOTEST_TUI_STDOUT AUTOTEST_TUI_STDERR AUTOTEST_TUI_STDOUT_FILE AUTOTEST_TUI_STDERR_FILE\n", f);
+                fputs("AUTOTEST_TUI_TEXT=\"$(cat \"$AUTOTEST_TUI_TEXT_FILE\" 2>/dev/null || true)\"\n", f);
+                fputs("export AUTOTEST_TUI_STATUS AUTOTEST_TUI_STDOUT AUTOTEST_TUI_STDERR AUTOTEST_TUI_TEXT AUTOTEST_TUI_STDOUT_FILE AUTOTEST_TUI_STDERR_FILE AUTOTEST_TUI_TEXT_FILE\n", f);
                 in_tui = false;
             } else if (line_starts_tui(p, len, tui_cmd, sizeof(tui_cmd))) {
                 fputs("  echo '[NG] nested @tui block' >&2\n  exit 1\n", f);
@@ -753,9 +762,11 @@ static void write_command_expanded(FILE *f, const char *command) {
         shell_quote_len(f, tui_cmd, strlen(tui_cmd));
         fputs(" \"$AUTOTEST_TUI_STDOUT_FILE\" >/dev/null 2>\"$AUTOTEST_TUI_STDERR_FILE\"\n", f);
         fputs("AUTOTEST_TUI_STATUS=\"$?\"\n", f);
+        fputs("autotest_clean_tui_output \"$AUTOTEST_TUI_STDOUT_FILE\" \"$AUTOTEST_TUI_TEXT_FILE\"\n", f);
         fputs("AUTOTEST_TUI_STDOUT=\"$(cat \"$AUTOTEST_TUI_STDOUT_FILE\" 2>/dev/null || true)\"\n", f);
         fputs("AUTOTEST_TUI_STDERR=\"$(cat \"$AUTOTEST_TUI_STDERR_FILE\" 2>/dev/null || true)\"\n", f);
-        fputs("export AUTOTEST_TUI_STATUS AUTOTEST_TUI_STDOUT AUTOTEST_TUI_STDERR AUTOTEST_TUI_STDOUT_FILE AUTOTEST_TUI_STDERR_FILE\n", f);
+        fputs("AUTOTEST_TUI_TEXT=\"$(cat \"$AUTOTEST_TUI_TEXT_FILE\" 2>/dev/null || true)\"\n", f);
+        fputs("export AUTOTEST_TUI_STATUS AUTOTEST_TUI_STDOUT AUTOTEST_TUI_STDERR AUTOTEST_TUI_TEXT AUTOTEST_TUI_STDOUT_FILE AUTOTEST_TUI_STDERR_FILE AUTOTEST_TUI_TEXT_FILE\n", f);
     }
 }
 
@@ -897,7 +908,7 @@ static void collect_check_directives(TestCase *tc) {
                 CheckRule *check = &tc->checks[count++];
                 copy_text(check->var, sizeof(check->var), var);
                 check->match = parse_match(match);
-                copy_text(check->expected, sizeof(check->expected), expected);
+                unescape_field(check->expected, sizeof(check->expected), expected);
                 found = true;
             }
         }
@@ -905,6 +916,54 @@ static void collect_check_directives(TestCase *tc) {
     }
     if (found) {
         tc->check_count = count;
+    }
+}
+
+static void sync_primary_check_directive(TestCase *tc) {
+    if (!tc || !tc->command[0]) return;
+    CheckRule *check = primary_check(tc);
+    char expected[LONG_LEN];
+    char replacement[LONG_LEN];
+    char updated[LONG_LEN];
+    size_t pos = 0;
+    bool replaced = false;
+    escape_field(expected, sizeof(expected), check->expected);
+    const char *parts[] = {
+        "@check ",
+        check->var[0] ? check->var : "AUTOTEST_ACTUAL",
+        " ",
+        match_name(check->match),
+        " ",
+        expected
+    };
+    size_t rpos = 0;
+    for (size_t i = 0; i < sizeof(parts) / sizeof(parts[0]); i++) {
+        for (const char *s = parts[i]; *s && rpos + 1 < sizeof(replacement); s++) {
+            replacement[rpos++] = *s;
+        }
+    }
+    replacement[rpos] = '\0';
+    const char *p = tc->command;
+    while (p && *p) {
+        const char *end = strchr(p, '\n');
+        size_t len = end ? (size_t)(end - p) : strlen(p);
+        char directive_arg[LONG_LEN];
+        const char *src = p;
+        size_t src_len = len;
+        if (!replaced && line_starts_directive(p, len, "@check", directive_arg, sizeof(directive_arg))) {
+            src = replacement;
+            src_len = strlen(replacement);
+            replaced = true;
+        }
+        if (pos + src_len + (end ? 1 : 0) + 1 >= sizeof(updated)) return;
+        memcpy(updated + pos, src, src_len);
+        pos += src_len;
+        if (end) updated[pos++] = '\n';
+        p = end ? end + 1 : NULL;
+    }
+    if (replaced) {
+        updated[pos] = '\0';
+        copy_text(tc->command, sizeof(tc->command), updated);
     }
 }
 
@@ -1021,13 +1080,15 @@ static int write_single_test_script(TestCase *tc) {
     fprintf(f, "RESULT_FILE=\"${SELF_PATH%%.sh}.result\"\n\n");
     fprintf(f, "MODE=run\n");
     fprintf(f, "DETAIL_RESULT_FILE=\"\"\n");
+    fprintf(f, "usage() { echo \"Usage: $0 [--detail-result PATH]\"; echo \"       $0 --resume\"; }\n");
     fprintf(f, "while [ \"$#\" -gt 0 ]; do\n");
     fprintf(f, "  case \"$1\" in\n");
     fprintf(f, "    --resume) MODE=--resume; shift ;;\n");
-    fprintf(f, "    --detail-result) shift; if [ \"$#\" -eq 0 ]; then echo '[NG] --detail-result requires a path' >&2; exit 2; fi; DETAIL_RESULT_FILE=\"$1\"; shift ;;\n");
+    fprintf(f, "    --detail-result) shift; if [ \"$#\" -eq 0 ]; then usage >&2; echo '[NG] --detail-result requires a path' >&2; exit 2; fi; DETAIL_RESULT_FILE=\"$1\"; shift ;;\n");
     fprintf(f, "    --detail-result=*) DETAIL_RESULT_FILE=\"${1#--detail-result=}\"; shift ;;\n");
-    fprintf(f, "    --help) echo \"Usage: $0 [--detail-result PATH]\"; echo \"       $0 --resume\"; exit 0 ;;\n");
-    fprintf(f, "    *) MODE=\"$1\"; shift ;;\n");
+    fprintf(f, "    --help) usage; exit 0 ;;\n");
+    fprintf(f, "    --*) usage >&2; echo \"[NG] unknown option: $1\" >&2; exit 2 ;;\n");
+    fprintf(f, "    *) usage >&2; echo \"[NG] unexpected argument: $1\" >&2; exit 2 ;;\n");
     fprintf(f, "  esac\n");
     fprintf(f, "done\n\n");
     fprintf(f, "WORK_DIR=\"${TMPDIR:-/tmp}/autotest-single.$$\"\n");
@@ -1362,8 +1423,8 @@ static void draw_editor(const App *app, int height, int width) {
     if (has_reboot(&app->project)) {
         mvprintw(bottom + 2, 1, "selected reboot tests may interrupt sequential execution");
     }
-    static const char *menu[] = {"Edit test", "Rename test", "Select test", "Delete test", "Variable match", "Preview selected", "Start selected tests", "Back"};
-    draw_menu(height - 4, 1, width - 2, menu, 8, app->selected_menu);
+    static const char *menu[] = {"Edit test", "Rename test", "Copy test", "Select test", "Delete test", "Variable match", "Preview selected", "Start selected tests", "Back"};
+    draw_menu(height - 4, 1, width - 2, menu, 9, app->selected_menu);
 }
 
 static void draw_form(const App *app, int height, int width) {
@@ -1997,11 +2058,54 @@ static bool editor_handle_normal_sequence(App *app, int ch) {
     return true;
 }
 
+static bool editor_handle_insert_escape_sequence(App *app) {
+    int seq[8];
+    int n = 0;
+    nodelay(stdscr, TRUE);
+    for (int i = 0; i < (int)(sizeof(seq) / sizeof(seq[0])); i++) {
+        int c = getch();
+        if (c == ERR) break;
+        seq[n++] = c;
+        if ((c >= '@' && c <= '~') || c == '~') break;
+    }
+    nodelay(stdscr, FALSE);
+    if (n == 0) return false;
+
+    bool handled = false;
+    if (n >= 2 && seq[0] == '[' && seq[1] == 'H') {
+        app->editor_col = 0;
+        handled = true;
+    } else if (n >= 2 && seq[0] == '[' && seq[1] == 'F') {
+        app->editor_col = (int)strlen(app->editor_lines[app->editor_row]);
+        handled = true;
+    } else if (n >= 2 && seq[0] == 'O' && seq[1] == 'H') {
+        app->editor_col = 0;
+        handled = true;
+    } else if (n >= 2 && seq[0] == 'O' && seq[1] == 'F') {
+        app->editor_col = (int)strlen(app->editor_lines[app->editor_row]);
+        handled = true;
+    } else if (n >= 3 && seq[0] == '[' && seq[2] == '~') {
+        if (seq[1] == '1' || seq[1] == '7') {
+            app->editor_col = 0;
+            handled = true;
+        } else if (seq[1] == '4' || seq[1] == '8') {
+            app->editor_col = (int)strlen(app->editor_lines[app->editor_row]);
+            handled = true;
+        }
+    }
+    if (!handled) {
+        for (int i = n - 1; i >= 0; i--) ungetch(seq[i]);
+    }
+    return handled;
+}
+
 static void handle_script_editor_key(App *app, int ch) {
     if (app->editor_insert) {
         if (ch == 27) {
-            app->editor_insert = false;
-            curs_set(0);
+            if (!editor_handle_insert_escape_sequence(app)) {
+                app->editor_insert = false;
+                curs_set(0);
+            }
         } else if (ch == '\n' || ch == KEY_ENTER) {
             editor_newline(app);
         } else if (ch == KEY_BACKSPACE || ch == 127 || ch == 8) {
@@ -2341,6 +2445,41 @@ static void rename_case(App *app) {
     }
 }
 
+static void copy_case(App *app) {
+    if (app->project.case_count == 0) return;
+    if (app->project.case_count >= MAX_CASES) {
+        set_status(app, "Maximum test cases reached.");
+        return;
+    }
+    TestCase new_case = app->project.cases[app->selected_case];
+    snprintf(new_case.id, sizeof(new_case.id), "TC%03d", app->project.case_count + 1);
+    char default_title[TEXT_LEN];
+    copy_text(default_title, sizeof(default_title), new_case.title[0] ? new_case.title : new_case.id);
+    if (strlen(default_title) + 5 < sizeof(default_title)) strcat(default_title, " copy");
+    copy_text(new_case.title, sizeof(new_case.title), default_title);
+    new_case.script_path[0] = '\0';
+    new_case.selected = true;
+    if (!prompt_text("copy test title", new_case.title, sizeof(new_case.title))) {
+        set_status(app, "Canceled test copy.");
+        return;
+    }
+    if (title_path_conflicts(&new_case, new_case.title)) {
+        set_status(app, "Script name already exists in this directory.");
+        return;
+    }
+    int rc = write_single_test_script(&new_case);
+    if (rc == 0) {
+        app->selected_case = app->project.case_count;
+        app->project.cases[app->project.case_count++] = new_case;
+        save_test_registry(&app->project);
+        set_status(app, "Copied test.");
+    } else if (rc == -2) {
+        set_status(app, "Script name already exists in this directory.");
+    } else {
+        set_status(app, "Failed to copy test.");
+    }
+}
+
 static void edit_selected_field(App *app) {
     if (app->project.case_count == 0) return;
     TestCase *tc = &app->project.cases[app->selected_case];
@@ -2411,6 +2550,15 @@ static void write_match_function(FILE *f) {
     fputs("  [ -d \"$dest\" ] || return 0\n", f);
     fputs("  if [ \"$(cat \"$dest/exists\" 2>/dev/null || echo 0)\" = 1 ]; then rm -rf \"$path\"; cp -a \"$dest/item\" \"$path\"; else rm -rf \"$path\"; fi\n", f);
     fputs("}\n\n", f);
+    fputs("autotest_clean_tui_output() {\n", f);
+    fputs("  input=\"$1\"\n", f);
+    fputs("  output=\"$2\"\n", f);
+    fputs("  if command -v perl >/dev/null 2>&1; then\n", f);
+    fputs("    perl -pe 's/\\e\\[[0-?]*[ -\\/]*[@-~]//g; s/\\e\\][^\\a]*(?:\\a|\\e\\\\)//g; s/\\r/\\n/g; s/[\\x00-\\x08\\x0B\\x0C\\x0E-\\x1F\\x7F]//g' \"$input\" >\"$output\"\n", f);
+    fputs("  else\n", f);
+    fputs("    sed -r 's/\\x1B\\[[0-?]*[ -\\/]*[@-~]//g' \"$input\" | tr '\\r' '\\n' | tr -d '\\000-\\010\\013\\014\\016-\\037\\177' >\"$output\"\n", f);
+    fputs("  fi\n", f);
+    fputs("}\n\n", f);
     fputs("autotest_write_detail_result() {\n", f);
     fputs("  detail_file=\"$1\"\n", f);
     fputs("  [ -n \"$detail_file\" ] || return 0\n", f);
@@ -2432,8 +2580,11 @@ static void write_match_function(FILE *f) {
     fputs("      i=$((i + 1))\n", f);
     fputs("    done\n", f);
     fputs("    echo \"actual_dir=${actual_dir-}\"\n", f);
+    fputs("    echo \"tui_text_file=${AUTOTEST_TUI_TEXT_FILE-}\"\n", f);
     fputs("    echo \"stdout_file=${stdout_file-}\"\n", f);
     fputs("    echo \"stderr_file=${stderr_file-}\"\n", f);
+    fputs("    echo '--- tui text ---'\n", f);
+    fputs("    [ -n \"${AUTOTEST_TUI_TEXT_FILE-}\" ] && [ -f \"$AUTOTEST_TUI_TEXT_FILE\" ] && cat \"$AUTOTEST_TUI_TEXT_FILE\"\n", f);
     fputs("    echo '--- stdout ---'\n", f);
     fputs("    [ -n \"${stdout_file-}\" ] && [ -f \"$stdout_file\" ] && cat \"$stdout_file\"\n", f);
     fputs("    echo '--- stderr ---'\n", f);
@@ -2921,15 +3072,16 @@ static void run_selected_menu(App *app) {
     case SCREEN_EDITOR:
         if (app->selected_menu == 0 && app->project.case_count) { app->editor_new_case = false; open_script_editor(app); }
         else if (app->selected_menu == 1 && app->project.case_count) rename_case(app);
-        else if (app->selected_menu == 2 && app->project.case_count) { app->project.cases[app->selected_case].selected = !app->project.cases[app->selected_case].selected; save_test_registry(&app->project); }
-        else if (app->selected_menu == 3) delete_case(app);
-        else if (app->selected_menu == 4) { app->screen = SCREEN_MATCH; app->selected_menu = 0; }
-        else if (app->selected_menu == 5) { app->selected_only = true; preview_script(app); app->screen = SCREEN_PREVIEW; app->selected_menu = 0; }
-        else if (app->selected_menu == 6) {
+        else if (app->selected_menu == 2 && app->project.case_count) copy_case(app);
+        else if (app->selected_menu == 3 && app->project.case_count) { app->project.cases[app->selected_case].selected = !app->project.cases[app->selected_case].selected; save_test_registry(&app->project); }
+        else if (app->selected_menu == 4) delete_case(app);
+        else if (app->selected_menu == 5) { app->screen = SCREEN_MATCH; app->selected_menu = 0; }
+        else if (app->selected_menu == 6) { app->selected_only = true; preview_script(app); app->screen = SCREEN_PREVIEW; app->selected_menu = 0; }
+        else if (app->selected_menu == 7) {
             if (selected_count(&app->project) == 0) set_status(app, "Select at least one test before starting.");
             else { app->selected_only = true; app->run_after_generate = true; app->previous_screen = app->screen; app->screen = SCREEN_CONFIRM; app->selected_menu = 0; }
         }
-        else if (app->selected_menu == 7) { app->screen = SCREEN_DASHBOARD; app->selected_menu = 0; }
+        else if (app->selected_menu == 8) { app->screen = SCREEN_DASHBOARD; app->selected_menu = 0; }
         break;
     case SCREEN_FORM:
         if (app->selected_menu == 0 || app->selected_menu == 1) edit_selected_field(app);
@@ -2953,8 +3105,8 @@ static void run_selected_menu(App *app) {
         break;
     case SCREEN_MATCH:
         if (app->project.case_count == 0) { app->screen = SCREEN_EDITOR; break; }
-        if (app->selected_menu == 0) { CheckRule *check = primary_check(&app->project.cases[app->selected_case]); prompt_text("check_var", check->var, sizeof(check->var)); write_single_test_script(&app->project.cases[app->selected_case]); save_test_registry(&app->project); }
-        else if (app->selected_menu == 1) { cycle_match(&primary_check(&app->project.cases[app->selected_case])->match); write_single_test_script(&app->project.cases[app->selected_case]); save_test_registry(&app->project); }
+        if (app->selected_menu == 0) { CheckRule *check = primary_check(&app->project.cases[app->selected_case]); prompt_text("check_var", check->var, sizeof(check->var)); sync_primary_check_directive(&app->project.cases[app->selected_case]); write_single_test_script(&app->project.cases[app->selected_case]); save_test_registry(&app->project); }
+        else if (app->selected_menu == 1) { cycle_match(&primary_check(&app->project.cases[app->selected_case])->match); sync_primary_check_directive(&app->project.cases[app->selected_case]); write_single_test_script(&app->project.cases[app->selected_case]); save_test_registry(&app->project); }
         else if (app->selected_menu == 2) { open_text_editor(app, EDIT_TARGET_CHECK_EXPECTED, SCREEN_MATCH); }
         else if (app->selected_menu == 3) { app->screen = SCREEN_EDITOR; app->selected_menu = 0; }
         break;
@@ -3028,7 +3180,7 @@ static void run_selected_menu(App *app) {
 static int menu_count_for(Screen s) {
     switch (s) {
     case SCREEN_DASHBOARD: return 5;
-    case SCREEN_EDITOR: return 8;
+    case SCREEN_EDITOR: return 9;
     case SCREEN_FORM: return 7;
     case SCREEN_MATCH: return 4;
     case SCREEN_CLEANUP: return 6;
@@ -3095,7 +3247,7 @@ int main(void) {
     cbreak();
     noecho();
     keypad(stdscr, TRUE);
-    set_escdelay(25);
+    set_escdelay(150);
     curs_set(0);
     if (has_colors()) {
         start_color();

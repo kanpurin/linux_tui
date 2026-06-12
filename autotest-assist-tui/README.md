@@ -45,14 +45,18 @@ been updated.
 Each `@tui` block stores the most recent pseudo-terminal session output in
 variables that can be used by later script lines and `@check` rules:
 
-- `AUTOTEST_TUI_STDOUT`: transcript captured from the pseudo terminal.
+- `AUTOTEST_TUI_STDOUT`: raw transcript captured from the pseudo terminal.
+- `AUTOTEST_TUI_TEXT`: cleaned transcript with ANSI/control characters removed.
 - `AUTOTEST_TUI_STDERR`: errors emitted by the `script` wrapper itself.
 - `AUTOTEST_TUI_STATUS`: exit status from the `script` command.
-- `AUTOTEST_TUI_STDOUT_FILE` / `AUTOTEST_TUI_STDERR_FILE`: backing files.
+- `AUTOTEST_TUI_STDOUT_FILE` / `AUTOTEST_TUI_TEXT_FILE` /
+  `AUTOTEST_TUI_STDERR_FILE`: backing files.
 
 Because TUI programs run through a pseudo terminal, the program's stdout and
-stderr may be merged by the terminal layer. For assertions, prefer `contains`
-or `regex` checks against `AUTOTEST_TUI_STDOUT`.
+stderr may be merged by the terminal layer. The raw transcript may contain
+cursor movement, colors, alternate-screen control bytes, and other terminal
+state. For assertions, prefer `contains` or `regex` checks against
+`AUTOTEST_TUI_TEXT`.
 
 ## Editor Help
 
@@ -79,6 +83,11 @@ From the test list, use `Rename test` to change an existing test title directly.
 The new name is checked immediately; if the generated script name already
 exists, the rename is rejected before the script is rewritten.
 
+Use `Copy test` from the test list to duplicate an existing test definition.
+The command, checks, cleanup, expected exit, and other test settings are copied.
+You choose a new title immediately; if the generated script name already exists,
+the copy is rejected before any new test is added.
+
 ## Generated Script Options
 
 Generated test scripts support an optional detailed result file:
@@ -91,6 +100,8 @@ The normal terminal output remains OK/NG focused. The detailed result file
 includes the status line, summary, expected/actual exit codes, variable check
 names and values, captured stdout, and captured stderr. For reboot tests, the
 detail result path is saved before reboot and reused by the resume run.
+
+Unknown options or unexpected arguments print usage and exit with status `2`.
 
 Linux 向けの「自動テスト作成支援」TUI です。`Create test` から独自エディタを開いてテストを作成し、作成済みテストを複数選択して自動テストを開始できます。
 

@@ -195,12 +195,24 @@ test_script_rename_source() {
   grep -Fq 'make_result_path(old_path' "$SRC"
 }
 
+test_copy_test_source() {
+  grep -Fq 'Copy test' "$SRC" &&
+  grep -Fq 'copy_case' "$SRC" &&
+  grep -Fq 'TestCase new_case = app->project.cases[app->selected_case]' "$SRC" &&
+  grep -Fq 'prompt_text("copy test title"' "$SRC" &&
+  grep -Fq 'title_path_conflicts(&new_case, new_case.title)' "$SRC" &&
+  grep -Fq 'write_single_test_script(&new_case)' "$SRC"
+}
+
 test_detail_result_source() {
   grep -Fq -- '--detail-result' "$SRC" &&
   grep -Fq 'DETAIL_RESULT_FILE' "$SRC" &&
   grep -Fq 'autotest_write_detail_result' "$SRC" &&
   grep -Fq 'detail_result_path' "$SRC" &&
   grep -Fq 'run_case_001 \"$MODE\"' "$SRC" &&
+  grep -Fq 'usage()' "$SRC" &&
+  grep -Fq 'unknown option:' "$SRC" &&
+  grep -Fq 'unexpected argument:' "$SRC" &&
   grep -Fq 'expected_exit=${expected_exit-}' "$SRC" &&
   grep -Fq -- '--- stdout ---' "$SRC" &&
   grep -Fq -- '--- stderr ---' "$SRC"
@@ -209,7 +221,10 @@ test_detail_result_source() {
 test_check_directive_source() {
   grep -Fq '@check' "$SRC" &&
   grep -Fq 'MAX_CHECKS' "$SRC" &&
-  grep -Fq 'write_validate_checks' "$SRC"
+  grep -Fq 'write_validate_checks' "$SRC" &&
+  grep -Fq 'sync_primary_check_directive' "$SRC" &&
+  grep -Fq 'unescape_field(check->expected' "$SRC" &&
+  grep -Fq 'escape_field(expected' "$SRC"
 }
 
 test_assert_directive_source() {
@@ -239,9 +254,13 @@ test_tui_source() {
 
 test_tui_capture_source() {
   grep -Fq 'AUTOTEST_TUI_STDOUT_FILE' "$SRC" &&
+  grep -Fq 'AUTOTEST_TUI_TEXT_FILE' "$SRC" &&
   grep -Fq 'AUTOTEST_TUI_STDERR_FILE' "$SRC" &&
+  grep -Fq 'autotest_clean_tui_output' "$SRC" &&
   grep -Fq 'AUTOTEST_TUI_STDOUT=' "$SRC" &&
+  grep -Fq 'AUTOTEST_TUI_TEXT=' "$SRC" &&
   grep -Fq 'cat \"$AUTOTEST_TUI_STDOUT_FILE\"' "$SRC" &&
+  grep -Fq 'cat \"$AUTOTEST_TUI_TEXT_FILE\"' "$SRC" &&
   grep -Fq 'AUTOTEST_TUI_STDERR=' "$SRC" &&
   grep -Fq 'cat \"$AUTOTEST_TUI_STDERR_FILE\"' "$SRC" &&
   grep -Fq 'AUTOTEST_TUI_STATUS=' "$SRC"
@@ -256,6 +275,8 @@ test_editor_source() {
   grep -Fq 'editor_help_open' "$SRC" &&
   grep -Fq 'editor_help_scroll' "$SRC" &&
   grep -Fq 'strcmp(app->editor_command, "help")' "$SRC" &&
+  grep -Fq 'editor_handle_insert_escape_sequence' "$SRC" &&
+  grep -Fq 'set_escdelay(150)' "$SRC" &&
   grep -Fq 'ch == KEY_DOWN' "$SRC" &&
   grep -Fq 'ch == KEY_UP' "$SRC"
 }
@@ -284,6 +305,7 @@ run_case 'build autotest-builder' test_build
 run_case 'title-based script filename source support' test_title_filename_source
 run_case 'script name collision source support' test_script_name_collision_source
 run_case 'script rename source support' test_script_rename_source
+run_case 'copy test source support' test_copy_test_source
 run_case 'detail result option source support' test_detail_result_source
 run_case 'variable match types' test_match_value
 run_case 'multiple variable checks pass' test_multiple_checks_all_pass
