@@ -48,9 +48,8 @@ match_value() {
   expected="$3"
   case "$type" in
     none) return 0 ;;
-    exact) [ "$actual" = "$expected" ] ;;
-    contains) case "$actual" in *"$expected"*) return 0 ;; *) return 1 ;; esac ;;
-    regex) printf '%s\n' "$actual" | grep -Eq -- "$expected" ;;
+    exact) AUTOTEST_MATCH_ACTUAL="$actual" AUTOTEST_MATCH_EXPECTED="$expected" awk 'BEGIN { pattern = "^(" ENVIRON["AUTOTEST_MATCH_EXPECTED"] ")$"; exit(ENVIRON["AUTOTEST_MATCH_ACTUAL"] ~ pattern ? 0 : 1) }' ;;
+    contains) AUTOTEST_MATCH_ACTUAL="$actual" AUTOTEST_MATCH_EXPECTED="$expected" awk 'BEGIN { exit(ENVIRON["AUTOTEST_MATCH_ACTUAL"] ~ ENVIRON["AUTOTEST_MATCH_EXPECTED"] ? 0 : 1) }' ;;
     empty) [ -z "$actual" ] ;;
     not_empty) [ -n "$actual" ] ;;
     *) return 1 ;;
@@ -98,7 +97,13 @@ test_build() {
 test_match_value() {
   match_value exact "active" "active" &&
   match_value contains "service active" "active" &&
-  match_value regex "12345" '^[[:digit:]]+$' &&
+  match_value exact "12345" '[[:digit:]]+' &&
+  match_value exact $'one\ntwo' $'one\ntwo' &&
+  match_value exact $'one\ntwo' $'^one\ntwo$' &&
+  match_value contains "abc123def" '[[:digit:]]+' &&
+  ! match_value exact "abc123def" '[[:digit:]]+' &&
+  ! match_value exact $'/a/b/c/d : protected\n/i/j : protected' '(/[[:alpha:]]+)+ : protected' &&
+  ! match_value exact $'one\ntwo' $'^one\ntwo\nthree$' &&
   match_value empty "" "" &&
   match_value not_empty "x" ""
 }
@@ -109,7 +114,7 @@ test_multiple_checks_all_pass() {
   C="hello world"
   ok=1
   match_value exact "$A" "active" || ok=0
-  match_value regex "$B" '^[[:digit:]]+$' || ok=0
+  match_value exact "$B" '[[:digit:]]+' || ok=0
   match_value contains "$C" "world" || ok=0
   [ "$ok" -eq 1 ]
 }
@@ -119,7 +124,7 @@ test_multiple_checks_one_fails() {
   B="abc"
   ok=1
   match_value exact "$A" "active" || ok=0
-  match_value regex "$B" '^[[:digit:]]+$' || ok=0
+  match_value exact "$B" '[[:digit:]]+' || ok=0
   [ "$ok" -eq 0 ]
 }
 
@@ -205,26 +210,68 @@ test_copy_test_source() {
 }
 
 test_detail_result_source() {
-  grep -Fq -- '--detail-result' "$SRC" &&
+  grep -Fq -- '--detail)' "$SRC" &&
+  grep -Fq -- '--detail=*)' "$SRC" &&
+  ! grep -Fq -- '--detail-result' "$SRC" &&
+  grep -Fq 'DETAIL_STDOUT' "$SRC" &&
   grep -Fq 'DETAIL_RESULT_FILE' "$SRC" &&
   grep -Fq 'autotest_write_detail_result' "$SRC" &&
+  grep -Fq 'autotest_detail_cat' "$SRC" &&
+  grep -Fq 'autotest_detail_kv' "$SRC" &&
+  grep -Fq 'autotest_detail_value' "$SRC" &&
+  grep -Fq 'autotest_detail_section' "$SRC" &&
+  grep -Fq 'local value=\"$2\"' "$SRC" &&
+  grep -Fq 'autotest_write_detail_outputs' "$SRC" &&
+  grep -Fq 'AUTOTEST_DETAIL_SAFE=1' "$SRC" &&
+  grep -Fq 'AUTOTEST_DETAIL_COLOR=1' "$SRC" &&
+  grep -Fq '\\033[36m%s\\033[0m=%s\\n' "$SRC" &&
+  grep -Fq '\\033[36m%s\\033[0m:\\n' "$SRC" &&
+  grep -Fq 'printf '\''%s\\n'\'' \"$value\" | cat -v' "$SRC" &&
+  grep -Fq 'AUTOTEST_DETAIL_SAFE:-0}' "$SRC" &&
+  grep -Fq 'cat -v' "$SRC" &&
+  grep -Fq 'autotest_detail_value \"expected $name\" \"$expected\"' "$SRC" &&
+  grep -Fq 'autotest_detail_value \"actual $name\" \"$value\"' "$SRC" &&
+  grep -Fq 'value_ref=\"actual_value_$i\"' "$SRC" &&
+  grep -Fq 'expected_ref=\"expected_value_$i\"' "$SRC" &&
+  grep -Fq 'value=\"${!value_ref}\"' "$SRC" &&
+  grep -Fq 'expected=\"${!expected_ref}\"' "$SRC" &&
+  grep -Fq 'check_match_%d=' "$SRC" &&
+  grep -Fq 'expected_value_%d=' "$SRC" &&
+  grep -Fq '[ -s \"$stdout_file\" ]' "$SRC" &&
+  grep -Fq 'autotest_write_detail_result -' "$SRC" &&
   grep -Fq 'detail_result_path' "$SRC" &&
-  grep -Fq 'run_case_001 \"$MODE\"' "$SRC" &&
+  grep -Fq 'detail_stdout' "$SRC" &&
+  grep -Fq 'run_case_001' "$SRC" &&
   grep -Fq 'usage()' "$SRC" &&
   grep -Fq 'unknown option:' "$SRC" &&
   grep -Fq 'unexpected argument:' "$SRC" &&
-  grep -Fq 'expected_exit=${expected_exit-}' "$SRC" &&
+  grep -Fq 'autotest_detail_kv expected_exit' "$SRC" &&
   grep -Fq -- '--- stdout ---' "$SRC" &&
   grep -Fq -- '--- stderr ---' "$SRC"
 }
 
 test_check_directive_source() {
   grep -Fq '@check' "$SRC" &&
-  grep -Fq 'MAX_CHECKS' "$SRC" &&
+  grep -Fq 'next_check_directive' "$SRC" &&
+  grep -Fq 'next_effective_check' "$SRC" &&
+  grep -Fq 'command_check_count' "$SRC" &&
+  grep -Fq 'parse_check_arg' "$SRC" &&
+  grep -Fq 'collect_check_heredoc' "$SRC" &&
+  grep -Fq 'skip_check_delim' "$SRC" &&
   grep -Fq 'write_validate_checks' "$SRC" &&
-  grep -Fq 'sync_primary_check_directive' "$SRC" &&
-  grep -Fq 'unescape_field(check->expected' "$SRC" &&
-  grep -Fq 'escape_field(expected' "$SRC"
+  grep -Fq 'AUTOTEST_MATCH_ACTUAL' "$SRC" &&
+  grep -Fq 'pattern = \"^(\"' "$SRC" &&
+  ! grep -Fq 'grep -Eq -- "$expected"' "$SRC" &&
+  ! grep -Fq 'MATCH_REGEX' "$SRC" &&
+  grep -Fq 'unescape_field(out->expected' "$SRC" &&
+  grep -Fq "@check <var> <match> <<'EOF'" "$SRC" &&
+  grep -Fq '@check <var> <match> <expected>' "$SRC" &&
+  grep -Fq 'exact: regex full match' "$SRC" &&
+  grep -Fq 'contains: regex search' "$SRC" &&
+  ! grep -Fq 'MAX_CHECKS' "$SRC" &&
+  ! grep -Fq 'Variable match' "$SRC" &&
+  ! grep -Fq 'checks: %d/%d' "$SRC" &&
+  ! grep -Fq 'sync_primary_check_directive' "$SRC"
 }
 
 test_assert_directive_source() {
@@ -249,18 +296,30 @@ test_tui_source() {
   grep -Fq 'text-shell' "$SRC" &&
   grep -Fq 'strcmp(trimmed, "esc")' "$SRC" &&
   grep -Fq 'strcmp(trimmed, "tab")' "$SRC" &&
+  grep -Fq 'strcmp(trimmed, "vim-clear")' "$SRC" &&
+  grep -Fq 'strcmp(trimmed, "vim-write-quit")' "$SRC" &&
+  grep -Fq "printf 'ggdG'" "$SRC" &&
+  grep -Fq "033:wq" "$SRC" &&
   grep -Fq 'invalid ctrl key' "$SRC"
 }
 
 test_tui_capture_source() {
+  grep -Fq 'AUTOTEST_TUI_TRANSCRIPT_FILE' "$SRC" &&
+  grep -Fq 'AUTOTEST_TUI_INPUT_FILE' "$SRC" &&
   grep -Fq 'AUTOTEST_TUI_STDOUT_FILE' "$SRC" &&
   grep -Fq 'AUTOTEST_TUI_TEXT_FILE' "$SRC" &&
   grep -Fq 'AUTOTEST_TUI_STDERR_FILE' "$SRC" &&
   grep -Fq 'autotest_clean_tui_output' "$SRC" &&
+  grep -Fq 's/\\r+\\n/\\n/g' "$SRC" &&
+  grep -Fq 'autotest_strip_tui_echo' "$SRC" &&
+  grep -Fq 'write_capture_tui_metadata' "$SRC" &&
+  grep -Fq 'write_load_tui_metadata' "$SRC" &&
+  grep -Fq 'AUTOTEST_TUI_TRANSCRIPT=' "$SRC" &&
   grep -Fq 'AUTOTEST_TUI_STDOUT=' "$SRC" &&
   grep -Fq 'AUTOTEST_TUI_TEXT=' "$SRC" &&
+  grep -Fq 'cat \"$AUTOTEST_TUI_TRANSCRIPT_FILE\"' "$SRC" &&
   grep -Fq 'cat \"$AUTOTEST_TUI_STDOUT_FILE\"' "$SRC" &&
-  grep -Fq 'cat \"$AUTOTEST_TUI_TEXT_FILE\"' "$SRC" &&
+  grep -Fq 'AUTOTEST_TUI_TEXT=\"$AUTOTEST_TUI_STDOUT\"' "$SRC" &&
   grep -Fq 'AUTOTEST_TUI_STDERR=' "$SRC" &&
   grep -Fq 'cat \"$AUTOTEST_TUI_STDERR_FILE\"' "$SRC" &&
   grep -Fq 'AUTOTEST_TUI_STATUS=' "$SRC"
@@ -275,7 +334,11 @@ test_editor_source() {
   grep -Fq 'editor_help_open' "$SRC" &&
   grep -Fq 'editor_help_scroll' "$SRC" &&
   grep -Fq 'strcmp(app->editor_command, "help")' "$SRC" &&
+  grep -Fq 'app->editor_target == EDIT_TARGET_COMMAND) return true' "$SRC" &&
+  grep -Fq 'strcmp(app->editor_command, "template")' "$SRC" &&
   grep -Fq 'editor_handle_insert_escape_sequence' "$SRC" &&
+  grep -Fq 'indent_len' "$SRC" &&
+  grep -Fq 'app->editor_col = copy_indent' "$SRC" &&
   grep -Fq 'set_escdelay(150)' "$SRC" &&
   grep -Fq 'ch == KEY_DOWN' "$SRC" &&
   grep -Fq 'ch == KEY_UP' "$SRC"
@@ -289,8 +352,28 @@ test_registry_source() {
 
 test_delete_source() {
   grep -Fq 'delete_case' "$SRC" &&
+  grep -Fq 'CONFIRM_DELETE' "$SRC" &&
+  grep -Fq 'Confirm Delete Test' "$SRC" &&
+  grep -Fq 'Delete selected test?' "$SRC" &&
+  grep -Fq 'app->confirm_action = CONFIRM_DELETE' "$SRC" &&
   grep -Fq 'unlink(deleted_path)' "$SRC" &&
   grep -Fq 'result_path' "$SRC"
+}
+
+test_result_display_source() {
+  grep -Fq 'selected_result_path' "$SRC" &&
+  grep -Fq 'autotest_selected.result' "$SRC" &&
+  grep -Fq 'Selected Test Results' "$SRC" &&
+  grep -Fq 'Start selected tests writes one aggregate result file' "$SRC" &&
+  grep -Fq 'AutoTest selected result' "$SRC" &&
+  grep -Fq 'autotest_selected.result' "$README" &&
+  grep -Fq 'one aggregate result file' "$README" &&
+  grep -Fq 'Summary: total=%d OK=%d NG=%d' "$SRC" &&
+  grep -Fq 'append_file_to_stream(result, result_path)' "$SRC" &&
+  grep -Fq 'unlink(result_path)' "$SRC" &&
+  ! grep -Fq 'case_display_status' "$SRC" &&
+  ! grep -Fq 'Statuses are read from each generated .result file' "$SRC" &&
+  ! grep -Fq 'tc->script_path[0] ? "OK" : "NG"' "$SRC"
 }
 
 test_docs_limitations() {
@@ -324,6 +407,7 @@ run_case '@tui output capture source support' test_tui_capture_source
 run_case 'editor command source support' test_editor_source
 run_case 'registry source support' test_registry_source
 run_case 'delete test source support' test_delete_source
+run_case 'result display source support' test_result_display_source
 run_case 'README limitations documentation' test_docs_limitations
 
 if [ "$FAILURES" -eq 0 ]; then

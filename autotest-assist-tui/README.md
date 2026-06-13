@@ -40,23 +40,75 @@ esac
 Use `runlevel` only after the system has completed the transition and utmp has
 been updated.
 
+## Variable Checks
+
+Write variable assertions directly in the test script with `@check`:
+
+```sh
+state=ready
+count=12
+
+@check state exact ready
+@check count exact [0-9]+
+```
+
+All `@check` lines must pass for the test to be OK. There is no fixed four-check
+limit; the builder scans every `@check` line in the script body.
+In the built-in script editor, use `:template` to open regex templates and
+insert common patterns while writing `@check` rules. `exact` and `contains` both
+accept extended regular expressions. `exact` must match the entire variable
+value; `contains` succeeds when the expression matches somewhere in the value.
+Multi-line patterns are matched as one multi-line pattern, not as independent
+line patterns. Legacy `regex` rules are read as `exact`.
+
+For multi-line expected values, use heredoc syntax:
+
+```sh
+actual=$(cat /tmp/output)
+
+@check actual exact <<'EOF'
+line1
+line2
+EOF
+```
+
 ## `@tui` Output Capture
 
 Each `@tui` block stores the most recent pseudo-terminal session output in
 variables that can be used by later script lines and `@check` rules:
 
-- `AUTOTEST_TUI_STDOUT`: raw transcript captured from the pseudo terminal.
-- `AUTOTEST_TUI_TEXT`: cleaned transcript with ANSI/control characters removed.
+- `AUTOTEST_TUI_STDOUT`: cleaned TUI output intended for assertions.
+- `AUTOTEST_TUI_TEXT`: same cleaned output as `AUTOTEST_TUI_STDOUT`.
+- `AUTOTEST_TUI_TRANSCRIPT`: raw transcript captured from the pseudo terminal.
 - `AUTOTEST_TUI_STDERR`: errors emitted by the `script` wrapper itself.
 - `AUTOTEST_TUI_STATUS`: exit status from the `script` command.
 - `AUTOTEST_TUI_STDOUT_FILE` / `AUTOTEST_TUI_TEXT_FILE` /
+  `AUTOTEST_TUI_TRANSCRIPT_FILE` / `AUTOTEST_TUI_INPUT_FILE` /
   `AUTOTEST_TUI_STDERR_FILE`: backing files.
 
 Because TUI programs run through a pseudo terminal, the program's stdout and
-stderr may be merged by the terminal layer. The raw transcript may contain
-cursor movement, colors, alternate-screen control bytes, and other terminal
-state. For assertions, prefer `contains` or `regex` checks against
-`AUTOTEST_TUI_TEXT`.
+stderr may be merged by the terminal layer. The raw transcript can contain
+cursor movement, colors, alternate-screen drawing, and other terminal state.
+For assertions, use `AUTOTEST_TUI_STDOUT` or `AUTOTEST_TUI_TEXT`. Use
+`AUTOTEST_TUI_TRANSCRIPT` only when you intentionally need the raw terminal
+session. If a TUI echoes the keys sent by the test at the beginning of the
+transcript, that echo is removed from the cleaned output.
+
+For example, opening vim and immediately quitting should leave the cleaned
+output empty:
+
+```sh
+@tui vim
+    vim-write-quit
+@end
+
+@check AUTOTEST_TUI_STDOUT empty
+```
+
+Vim-specific shortcuts are available inside `@tui` blocks:
+
+- `vim-clear`: send `ggdG` to clear the buffer in normal mode.
+- `vim-write-quit`: send Escape, then `:wq` and Enter.
 
 ## Editor Help
 
@@ -90,18 +142,39 @@ the copy is rejected before any new test is added.
 
 ## Generated Script Options
 
-Generated test scripts support an optional detailed result file:
+Generated test scripts support detailed result output:
 
 ```sh
-./service_check.sh --detail-result /tmp/service_check.detail
+./service_check.sh --detail
+./service_check.sh --detail /tmp/service_check.detail
+./service_check.sh --detail=/tmp/service_check.detail
 ```
 
-The normal terminal output remains OK/NG focused. The detailed result file
-includes the status line, summary, expected/actual exit codes, variable check
-names and values, captured stdout, and captured stderr. For reboot tests, the
-detail result path is saved before reboot and reused by the resume run.
+The normal terminal output remains OK/NG focused unless `--detail` is used.
+The detailed result includes the status line, summary, expected/actual exit
+codes, variable check names and values, captured stdout, and captured stderr.
+Use `--detail` to print it to stdout, or `--detail PATH` to write it to a file.
+Stdout detail output colors keys, prints each checked variable by name, and
+shows the match type plus expected/actual values for comparison. It omits
+temporary paths plus raw TUI transcripts. File detail output keeps the full debug
+data, including TUI text/transcript sections. Captured control characters are
+made visible instead of being sent back to the terminal. For reboot tests, the
+detail output settings are saved before reboot and reused by the resume run.
 
 Unknown options or unexpected arguments print usage and exit with status `2`.
+
+## Selected Test Result
+
+`Start selected tests` writes one aggregate result file in the directory where
+the TUI was started:
+
+```sh
+./autotest_selected.result
+```
+
+Each selected test is still executed sequentially, but the selected-run result
+is reported through this single aggregate file. Individual test `.result` files
+created as part of the run are folded into the aggregate result and removed.
 
 Linux 向けの「自動テスト作成支援」TUI です。`Create test` から独自エディタを開いてテストを作成し、作成済みテストを複数選択して自動テストを開始できます。
 
@@ -244,7 +317,7 @@ match_type: contains
 
 ```text
 expected_stdout: '^[0-9]+ +/usr/bin/myapp$'
-match_type: regex
+match_type: exact
 ```
 
 ### 行単位一致
@@ -432,7 +505,7 @@ run_test() {
 - プロジェクト一覧
 - テストケース新規作成
 - command, expected_exit, stdout/stderr 判定の編集
-- 判定方式: exact, contains, regex, empty, not_empty
+- 判定方式: exact, contains, empty, not_empty
 - cleanup の編集
 - reboot フェーズの選択
 - Bash スクリプト生成
@@ -470,7 +543,7 @@ apt-get install -y build-essential libncurses-dev
 - エディタ操作: `i` で入力、`Esc` でノーマル、`:wq` で保存、`:q` で破棄
 - テストケースの追加/編集/削除
 - `expected_exit` の設定
-- stdout/stderr の `none`, `exact`, `contains`, `regex`, `empty`, `not_empty`
+- stdout/stderr の `none`, `exact`, `contains`, `empty`, `not_empty`
 - 再起動前/後フェーズの設定
 - cleanup コマンドの設定
 - Bash スクリプトプレビュー

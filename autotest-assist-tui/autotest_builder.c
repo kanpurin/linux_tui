@@ -6,6 +6,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #define MAX_CASES 64
@@ -17,7 +18,7 @@
 #define EDITOR_COLS 256
 #define REGISTRY_LINE (LONG_LEN * 4)
 #define EDITOR_TAB_WIDTH 4
-#define MAX_CHECKS 4
+#define LEGACY_REGISTRY_CHECKS 4
 
 typedef enum {
     SCREEN_DASHBOARD,
@@ -36,7 +37,6 @@ typedef enum {
     MATCH_NONE,
     MATCH_EXACT,
     MATCH_CONTAINS,
-    MATCH_REGEX,
     MATCH_EMPTY,
     MATCH_NOT_EMPTY
 } MatchType;
@@ -52,6 +52,11 @@ typedef enum {
     EDIT_TARGET_CHECK_EXPECTED
 } EditorTarget;
 
+typedef enum {
+    CONFIRM_GENERATE,
+    CONFIRM_DELETE
+} ConfirmAction;
+
 typedef struct {
     char var[TEXT_LEN];
     MatchType match;
@@ -66,7 +71,7 @@ typedef struct {
     CommandKind kind;
     bool selected;
     int expected_exit;
-    CheckRule checks[MAX_CHECKS];
+    CheckRule checks[LEGACY_REGISTRY_CHECKS];
     int check_count;
     char cleanup[LONG_LEN];
     int timeout_sec;
@@ -92,6 +97,7 @@ typedef struct {
     int selected_preview_file;
     bool selected_only;
     bool run_after_generate;
+    ConfirmAction confirm_action;
     char editor_lines[EDITOR_LINES][EDITOR_COLS];
     int editor_line_count;
     int editor_row;
@@ -151,6 +157,12 @@ static const char *EDITOR_HELP_LINES[] = {
     "",
     "Script directives",
     "@check <var> <match> <expected>  Add a variable assertion.",
+    "@check <var> <match> <<'EOF'    Use heredoc expected text.",
+    "    exact      Regex must match the whole variable value.",
+    "    empty      Variable value must be empty.",
+    "    contains   Regex must match somewhere in the value.",
+    "    not_empty  Variable value must not be empty.",
+    "    none       No variable check.",
     "@assert <condition>             Fail immediately when condition is false.",
     "@backup <path>                  Save file or directory before mutation.",
     "@restore <path>                 Restore a previously backed-up path.",
@@ -166,18 +178,23 @@ static const char *EDITOR_HELP_LINES[] = {
     "enter / esc / tab / space       Send common keys.",
     "sleep <seconds>                 Wait.",
     "ctrl <key>                      Send Ctrl key, example: ctrl c.",
+    "vim-clear                       Vim normal-mode clear buffer.",
+    "vim-write-quit                  Vim :wq.",
     "",
     "TUI output variables",
-    "AUTOTEST_TUI_STDOUT             Last pseudo-terminal transcript.",
-    "AUTOTEST_TUI_TEXT               ANSI/control-stripped TUI text.",
+    "AUTOTEST_TUI_STDOUT             Cleaned TUI output for assertions.",
+    "AUTOTEST_TUI_TEXT               Same cleaned TUI output.",
+    "AUTOTEST_TUI_TRANSCRIPT         Raw pseudo-terminal transcript.",
     "AUTOTEST_TUI_STDERR             Last script-wrapper stderr.",
     "AUTOTEST_TUI_STATUS             Last script-wrapper exit status.",
-    "AUTOTEST_TUI_STDOUT_FILE        Transcript backing file.",
+    "AUTOTEST_TUI_STDOUT_FILE        Clean output backing file.",
     "AUTOTEST_TUI_TEXT_FILE          Clean text backing file.",
+    "AUTOTEST_TUI_TRANSCRIPT_FILE    Raw transcript backing file.",
+    "AUTOTEST_TUI_INPUT_FILE         Sent printable input backing file.",
     "AUTOTEST_TUI_STDERR_FILE        Stderr backing file.",
     "",
     "Generated script options",
-    "--detail-result <path>          Write detailed result report to file.",
+    "--detail [path]                Detail to stdout, or file when path given.",
     "--help                          Show generated script usage.",
     "unknown option                  Show usage and exit with error.",
     "",
@@ -198,14 +215,14 @@ static void save_test_registry(const Project *p);
 static bool command_looks_like_reboot(const char *cmd);
 static void trim_line_copy(char *dst, size_t dst_sz, const char *line, size_t len);
 static void copy_text(char *dst, size_t dst_sz, const char *src);
-static void sync_primary_check_directive(TestCase *tc);
+static bool parse_check_arg(const char *arg, CheckRule *out, char *heredoc_delim, size_t heredoc_delim_sz);
+static void collect_check_heredoc(const char *body_start, const char *delim, char *out, size_t out_sz, const char **after);
 
 static const char *match_name(MatchType m) {
     switch (m) {
     case MATCH_NONE: return "none";
     case MATCH_EXACT: return "exact";
     case MATCH_CONTAINS: return "contains";
-    case MATCH_REGEX: return "regex";
     case MATCH_EMPTY: return "empty";
     case MATCH_NOT_EMPTY: return "not_empty";
     }
@@ -386,6 +403,7 @@ static void unescape_field(char *dst, size_t dst_sz, const char *src) {
 }
 
 static MatchType parse_match(const char *s) {
+    if (strcmp(s, "regex") == 0) return MATCH_EXACT;
     for (int i = MATCH_NONE; i <= MATCH_NOT_EMPTY; i++) {
         if (strcmp(s, match_name((MatchType)i)) == 0) return (MatchType)i;
     }
@@ -393,6 +411,7 @@ static MatchType parse_match(const char *s) {
 }
 
 static bool is_match_name(const char *s) {
+    if (strcmp(s, "regex") == 0) return true;
     for (int i = MATCH_NONE; i <= MATCH_NOT_EMPTY; i++) {
         if (strcmp(s, match_name((MatchType)i)) == 0) return true;
     }
@@ -515,7 +534,6 @@ static void save_editor_to_case(App *app) {
     if (app->editor_target == EDIT_TARGET_CHECK_EXPECTED) {
         CheckRule *check = primary_check(tc);
         save_editor_text(app, check->expected, sizeof(check->expected));
-        sync_primary_check_directive(tc);
     } else {
         save_editor_text(app, tc->command, sizeof(tc->command));
         tc->kind = CMD_SHELL;
@@ -525,9 +543,11 @@ static void save_editor_to_case(App *app) {
 
 static bool editor_uses_regex_templates(const App *app) {
     if (app->project.case_count == 0) return false;
+    if (app->editor_target == EDIT_TARGET_COMMAND) return true;
     const TestCase *tc = &app->project.cases[app->selected_case];
     const CheckRule *check = primary_check_const(tc);
-    return app->editor_target == EDIT_TARGET_CHECK_EXPECTED && check && check->match == MATCH_REGEX;
+    return app->editor_target == EDIT_TARGET_CHECK_EXPECTED && check &&
+           (check->match == MATCH_EXACT || check->match == MATCH_CONTAINS);
 }
 
 static bool text_contains(const char *haystack, const char *needle) {
@@ -645,27 +665,48 @@ static void write_tui_instruction(FILE *f, const char *line, size_t len) {
     if (strncmp(trimmed, "send ", 5) == 0) {
         fputs("  printf ", f);
         shell_quote_len(f, trimmed + 5, strlen(trimmed + 5));
+        fputs(" >>\"$AUTOTEST_TUI_INPUT_FILE\"\n", f);
+        fputs("  printf ", f);
+        shell_quote_len(f, trimmed + 5, strlen(trimmed + 5));
         fputc('\n', f);
     } else if (strncmp(trimmed, "send-shell ", 11) == 0) {
+        fputs("  printf '%s' ", f);
+        fputs(trimmed + 11, f);
+        fputs(" >>\"$AUTOTEST_TUI_INPUT_FILE\"\n", f);
         fputs("  printf '%s' ", f);
         fputs(trimmed + 11, f);
         fputc('\n', f);
     } else if (strncmp(trimmed, "text ", 5) == 0) {
         fputs("  printf ", f);
         shell_quote_len(f, trimmed + 5, strlen(trimmed + 5));
+        fputs(" >>\"$AUTOTEST_TUI_INPUT_FILE\"\n  printf '\\n' >>\"$AUTOTEST_TUI_INPUT_FILE\"\n", f);
+        fputs("  printf ", f);
+        shell_quote_len(f, trimmed + 5, strlen(trimmed + 5));
         fputs("\n  printf '\\n'\n", f);
     } else if (strncmp(trimmed, "text-shell ", 11) == 0) {
         fputs("  printf '%s\\n' ", f);
         fputs(trimmed + 11, f);
+        fputs(" >>\"$AUTOTEST_TUI_INPUT_FILE\"\n", f);
+        fputs("  printf '%s\\n' ", f);
+        fputs(trimmed + 11, f);
         fputc('\n', f);
     } else if (strcmp(trimmed, "enter") == 0) {
+        fputs("  printf '\\n' >>\"$AUTOTEST_TUI_INPUT_FILE\"\n", f);
         fputs("  printf '\\r'\n", f);
     } else if (strcmp(trimmed, "esc") == 0) {
         fputs("  printf '\\033'\n", f);
     } else if (strcmp(trimmed, "tab") == 0) {
+        fputs("  printf '\\t' >>\"$AUTOTEST_TUI_INPUT_FILE\"\n", f);
         fputs("  printf '\\t'\n", f);
     } else if (strcmp(trimmed, "space") == 0) {
+        fputs("  printf ' ' >>\"$AUTOTEST_TUI_INPUT_FILE\"\n", f);
         fputs("  printf ' '\n", f);
+    } else if (strcmp(trimmed, "vim-clear") == 0) {
+        fputs("  printf 'ggdG' >>\"$AUTOTEST_TUI_INPUT_FILE\"\n", f);
+        fputs("  printf 'ggdG'\n", f);
+    } else if (strcmp(trimmed, "vim-write-quit") == 0) {
+        fputs("  printf ':wq\\n' >>\"$AUTOTEST_TUI_INPUT_FILE\"\n", f);
+        fputs("  printf '\\033:wq\\r'\n", f);
     } else if (strncmp(trimmed, "sleep ", 6) == 0) {
         fputs("  sleep ", f);
         for (const char *p = trimmed + 6; *p; p++) {
@@ -697,20 +738,33 @@ static void write_shell_line(FILE *f, const char *line, size_t len) {
 static void write_command_expanded(FILE *f, const char *command) {
     bool in_tui = false;
     char tui_cmd[LONG_LEN];
+    char skip_check_delim[TEXT_LEN] = "";
     const char *p = command;
     while (p && *p) {
         const char *end = strchr(p, '\n');
         size_t len = end ? (size_t)(end - p) : strlen(p);
+        if (skip_check_delim[0]) {
+            char trimmed[TEXT_LEN];
+            trim_line_copy(trimmed, sizeof(trimmed), p, len);
+            if (strcmp(trimmed, skip_check_delim) == 0) skip_check_delim[0] = '\0';
+            p = end ? end + 1 : NULL;
+            continue;
+        }
         if (!in_tui) {
             char directive_arg[LONG_LEN];
             if (line_starts_tui(p, len, tui_cmd, sizeof(tui_cmd))) {
                 fputs("if ! command -v script >/dev/null 2>&1; then echo '[NG] missing script command' >&2; exit 1; fi\n", f);
                 fputs("AUTOTEST_TUI_INDEX=$(( ${AUTOTEST_TUI_INDEX:-0} + 1 ))\n", f);
                 fputs("AUTOTEST_TUI_DIR=\"${AUTOTEST_TUI_DIR:-${WORK_DIR:-/tmp}/autotest-tui}\"\n", f);
+                fputs("AUTOTEST_TUI_TERM=\"${TERM:-xterm}\"\n", f);
+                fputs("[ \"$AUTOTEST_TUI_TERM\" = dumb ] && AUTOTEST_TUI_TERM=xterm\n", f);
                 fputs("mkdir -p \"$AUTOTEST_TUI_DIR\"\n", f);
+                fputs("AUTOTEST_TUI_TRANSCRIPT_FILE=\"$AUTOTEST_TUI_DIR/tui_${AUTOTEST_TUI_INDEX}.transcript\"\n", f);
                 fputs("AUTOTEST_TUI_STDOUT_FILE=\"$AUTOTEST_TUI_DIR/tui_${AUTOTEST_TUI_INDEX}.stdout\"\n", f);
                 fputs("AUTOTEST_TUI_STDERR_FILE=\"$AUTOTEST_TUI_DIR/tui_${AUTOTEST_TUI_INDEX}.stderr\"\n", f);
-                fputs("AUTOTEST_TUI_TEXT_FILE=\"$AUTOTEST_TUI_DIR/tui_${AUTOTEST_TUI_INDEX}.text\"\n", f);
+                fputs("AUTOTEST_TUI_INPUT_FILE=\"$AUTOTEST_TUI_DIR/tui_${AUTOTEST_TUI_INDEX}.input\"\n", f);
+                fputs("AUTOTEST_TUI_TEXT_FILE=\"$AUTOTEST_TUI_STDOUT_FILE\"\n", f);
+                fputs(": >\"$AUTOTEST_TUI_INPUT_FILE\"\n", f);
                 fputs("{\n", f);
                 in_tui = true;
             } else if (line_starts_directive(p, len, "@assert", directive_arg, sizeof(directive_arg))) {
@@ -730,6 +784,11 @@ static void write_command_expanded(FILE *f, const char *command) {
                 fputs(directive_arg, f);
                 fputc('\n', f);
             } else if (line_starts_directive(p, len, "@check", directive_arg, sizeof(directive_arg))) {
+                CheckRule parsed;
+                char heredoc_delim[TEXT_LEN];
+                if (parse_check_arg(directive_arg, &parsed, heredoc_delim, sizeof(heredoc_delim)) && heredoc_delim[0]) {
+                    copy_text(skip_check_delim, sizeof(skip_check_delim), heredoc_delim);
+                }
                 fputs(": # @check handled by autotest builder\n", f);
             } else if (line_is_tui_end(p, len)) {
                 fputs("echo '[NG] @end without @tui' >&2\nexit 1\n", f);
@@ -738,15 +797,17 @@ static void write_command_expanded(FILE *f, const char *command) {
             }
         } else {
             if (line_is_tui_end(p, len)) {
-                fputs("} | script -q -c ", f);
+                fputs("} | TERM=\"$AUTOTEST_TUI_TERM\" script -q -c ", f);
                 shell_quote_len(f, tui_cmd, strlen(tui_cmd));
-                fputs(" \"$AUTOTEST_TUI_STDOUT_FILE\" >/dev/null 2>\"$AUTOTEST_TUI_STDERR_FILE\"\n", f);
+                fputs(" \"$AUTOTEST_TUI_TRANSCRIPT_FILE\" >/dev/null 2>\"$AUTOTEST_TUI_STDERR_FILE\"\n", f);
                 fputs("AUTOTEST_TUI_STATUS=\"$?\"\n", f);
-                fputs("autotest_clean_tui_output \"$AUTOTEST_TUI_STDOUT_FILE\" \"$AUTOTEST_TUI_TEXT_FILE\"\n", f);
+                fputs("autotest_clean_tui_output \"$AUTOTEST_TUI_TRANSCRIPT_FILE\" \"$AUTOTEST_TUI_STDOUT_FILE\"\n", f);
+                fputs("autotest_strip_tui_echo \"$AUTOTEST_TUI_STDOUT_FILE\" \"$AUTOTEST_TUI_INPUT_FILE\"\n", f);
+                fputs("AUTOTEST_TUI_TRANSCRIPT=\"$(cat \"$AUTOTEST_TUI_TRANSCRIPT_FILE\" 2>/dev/null || true)\"\n", f);
                 fputs("AUTOTEST_TUI_STDOUT=\"$(cat \"$AUTOTEST_TUI_STDOUT_FILE\" 2>/dev/null || true)\"\n", f);
                 fputs("AUTOTEST_TUI_STDERR=\"$(cat \"$AUTOTEST_TUI_STDERR_FILE\" 2>/dev/null || true)\"\n", f);
-                fputs("AUTOTEST_TUI_TEXT=\"$(cat \"$AUTOTEST_TUI_TEXT_FILE\" 2>/dev/null || true)\"\n", f);
-                fputs("export AUTOTEST_TUI_STATUS AUTOTEST_TUI_STDOUT AUTOTEST_TUI_STDERR AUTOTEST_TUI_TEXT AUTOTEST_TUI_STDOUT_FILE AUTOTEST_TUI_STDERR_FILE AUTOTEST_TUI_TEXT_FILE\n", f);
+                fputs("AUTOTEST_TUI_TEXT=\"$AUTOTEST_TUI_STDOUT\"\n", f);
+                fputs("export AUTOTEST_TUI_STATUS AUTOTEST_TUI_STDOUT AUTOTEST_TUI_STDERR AUTOTEST_TUI_TEXT AUTOTEST_TUI_TRANSCRIPT AUTOTEST_TUI_STDOUT_FILE AUTOTEST_TUI_STDERR_FILE AUTOTEST_TUI_TEXT_FILE AUTOTEST_TUI_TRANSCRIPT_FILE AUTOTEST_TUI_INPUT_FILE\n", f);
                 in_tui = false;
             } else if (line_starts_tui(p, len, tui_cmd, sizeof(tui_cmd))) {
                 fputs("  echo '[NG] nested @tui block' >&2\n  exit 1\n", f);
@@ -758,15 +819,17 @@ static void write_command_expanded(FILE *f, const char *command) {
     }
     if (in_tui) {
         fputs("  echo '[NG] missing @end for @tui block' >&2\n  exit 1\n", f);
-        fputs("} | script -q -c ", f);
+        fputs("} | TERM=\"$AUTOTEST_TUI_TERM\" script -q -c ", f);
         shell_quote_len(f, tui_cmd, strlen(tui_cmd));
-        fputs(" \"$AUTOTEST_TUI_STDOUT_FILE\" >/dev/null 2>\"$AUTOTEST_TUI_STDERR_FILE\"\n", f);
+        fputs(" \"$AUTOTEST_TUI_TRANSCRIPT_FILE\" >/dev/null 2>\"$AUTOTEST_TUI_STDERR_FILE\"\n", f);
         fputs("AUTOTEST_TUI_STATUS=\"$?\"\n", f);
-        fputs("autotest_clean_tui_output \"$AUTOTEST_TUI_STDOUT_FILE\" \"$AUTOTEST_TUI_TEXT_FILE\"\n", f);
+        fputs("autotest_clean_tui_output \"$AUTOTEST_TUI_TRANSCRIPT_FILE\" \"$AUTOTEST_TUI_STDOUT_FILE\"\n", f);
+        fputs("autotest_strip_tui_echo \"$AUTOTEST_TUI_STDOUT_FILE\" \"$AUTOTEST_TUI_INPUT_FILE\"\n", f);
+        fputs("AUTOTEST_TUI_TRANSCRIPT=\"$(cat \"$AUTOTEST_TUI_TRANSCRIPT_FILE\" 2>/dev/null || true)\"\n", f);
         fputs("AUTOTEST_TUI_STDOUT=\"$(cat \"$AUTOTEST_TUI_STDOUT_FILE\" 2>/dev/null || true)\"\n", f);
         fputs("AUTOTEST_TUI_STDERR=\"$(cat \"$AUTOTEST_TUI_STDERR_FILE\" 2>/dev/null || true)\"\n", f);
-        fputs("AUTOTEST_TUI_TEXT=\"$(cat \"$AUTOTEST_TUI_TEXT_FILE\" 2>/dev/null || true)\"\n", f);
-        fputs("export AUTOTEST_TUI_STATUS AUTOTEST_TUI_STDOUT AUTOTEST_TUI_STDERR AUTOTEST_TUI_TEXT AUTOTEST_TUI_STDOUT_FILE AUTOTEST_TUI_STDERR_FILE AUTOTEST_TUI_TEXT_FILE\n", f);
+        fputs("AUTOTEST_TUI_TEXT=\"$AUTOTEST_TUI_STDOUT\"\n", f);
+        fputs("export AUTOTEST_TUI_STATUS AUTOTEST_TUI_STDOUT AUTOTEST_TUI_STDERR AUTOTEST_TUI_TEXT AUTOTEST_TUI_TRANSCRIPT AUTOTEST_TUI_STDOUT_FILE AUTOTEST_TUI_STDERR_FILE AUTOTEST_TUI_TEXT_FILE AUTOTEST_TUI_TRANSCRIPT_FILE AUTOTEST_TUI_INPUT_FILE\n", f);
     }
 }
 
@@ -885,90 +948,158 @@ static void collect_temp_paths(TestCase *tc, const char *prefix) {
     }
 }
 
+static bool parse_check_arg(const char *arg, CheckRule *out, char *heredoc_delim, size_t heredoc_delim_sz) {
+    char buf[LONG_LEN];
+    copy_text(buf, sizeof(buf), arg);
+    if (heredoc_delim && heredoc_delim_sz > 0) heredoc_delim[0] = '\0';
+    char *var = buf;
+    while (isspace((unsigned char)*var)) var++;
+    char *match = var;
+    while (*match && !isspace((unsigned char)*match)) match++;
+    if (*match) *match++ = '\0';
+    while (isspace((unsigned char)*match)) match++;
+    char *expected = match;
+    while (*expected && !isspace((unsigned char)*expected)) expected++;
+    if (*expected) *expected++ = '\0';
+    while (isspace((unsigned char)*expected)) expected++;
+    if (!var[0] || !match[0]) return false;
+    memset(out, 0, sizeof(*out));
+    copy_text(out->var, sizeof(out->var), var);
+    out->match = parse_match(match);
+    if (strncmp(expected, "<<", 2) == 0) {
+        char *delim = expected + 2;
+        if (*delim == '-') delim++;
+        while (isspace((unsigned char)*delim)) delim++;
+        if (*delim == '\'' || *delim == '"') {
+            char quote = *delim++;
+            char *end = strchr(delim, quote);
+            if (end) *end = '\0';
+        } else {
+            char *end = delim;
+            while (*end && !isspace((unsigned char)*end)) end++;
+            *end = '\0';
+        }
+        if (delim[0] && heredoc_delim && heredoc_delim_sz > 0) {
+            copy_text(heredoc_delim, heredoc_delim_sz, delim);
+            out->expected[0] = '\0';
+            return true;
+        }
+    }
+    unescape_field(out->expected, sizeof(out->expected), expected);
+    return true;
+}
+
+static void collect_check_heredoc(const char *body_start, const char *delim, char *out, size_t out_sz, const char **after) {
+    const char *p = body_start;
+    size_t pos = 0;
+    bool first = true;
+    if (out_sz > 0) out[0] = '\0';
+    while (p && *p) {
+        const char *end = strchr(p, '\n');
+        size_t len = end ? (size_t)(end - p) : strlen(p);
+        char trimmed[TEXT_LEN];
+        trim_line_copy(trimmed, sizeof(trimmed), p, len);
+        if (strcmp(trimmed, delim) == 0) {
+            if (after) *after = end ? end + 1 : NULL;
+            return;
+        }
+        if (!first && pos + 1 < out_sz) out[pos++] = '\n';
+        first = false;
+        if (pos + len >= out_sz) len = out_sz > pos ? out_sz - pos - 1 : 0;
+        if (len > 0) {
+            memcpy(out + pos, p, len);
+            pos += len;
+        }
+        if (out_sz > 0) out[pos] = '\0';
+        p = end ? end + 1 : NULL;
+    }
+    if (after) *after = NULL;
+}
+
 static void collect_check_directives(TestCase *tc) {
-    bool found = false;
     int count = 0;
+    bool stored_first = false;
     const char *p = tc->command;
+    memset(tc->checks, 0, sizeof(tc->checks));
     while (p && *p) {
         const char *end = strchr(p, '\n');
         size_t len = end ? (size_t)(end - p) : strlen(p);
         char arg[LONG_LEN];
         if (line_starts_directive(p, len, "@check", arg, sizeof(arg))) {
-            char *var = arg;
-            while (isspace((unsigned char)*var)) var++;
-            char *match = var;
-            while (*match && !isspace((unsigned char)*match)) match++;
-            if (*match) *match++ = '\0';
-            while (isspace((unsigned char)*match)) match++;
-            char *expected = match;
-            while (*expected && !isspace((unsigned char)*expected)) expected++;
-            if (*expected) *expected++ = '\0';
-            while (isspace((unsigned char)*expected)) expected++;
-            if (var[0] && match[0] && count < MAX_CHECKS) {
-                CheckRule *check = &tc->checks[count++];
-                copy_text(check->var, sizeof(check->var), var);
-                check->match = parse_match(match);
-                unescape_field(check->expected, sizeof(check->expected), expected);
-                found = true;
+            CheckRule parsed;
+            char heredoc_delim[TEXT_LEN];
+            if (parse_check_arg(arg, &parsed, heredoc_delim, sizeof(heredoc_delim))) {
+                const char *next = end ? end + 1 : NULL;
+                if (heredoc_delim[0]) {
+                    collect_check_heredoc(next, heredoc_delim, parsed.expected, sizeof(parsed.expected), &next);
+                    p = next;
+                } else {
+                    p = next;
+                }
+                if (!stored_first) {
+                    CheckRule *check = &tc->checks[0];
+                    *check = parsed;
+                    stored_first = true;
+                }
+                count++;
+                continue;
             }
         }
         p = end ? end + 1 : NULL;
     }
-    if (found) {
-        tc->check_count = count;
-    }
+    tc->check_count = count;
 }
 
-static void sync_primary_check_directive(TestCase *tc) {
-    if (!tc || !tc->command[0]) return;
-    CheckRule *check = primary_check(tc);
-    char expected[LONG_LEN];
-    char replacement[LONG_LEN];
-    char updated[LONG_LEN];
-    size_t pos = 0;
-    bool replaced = false;
-    escape_field(expected, sizeof(expected), check->expected);
-    const char *parts[] = {
-        "@check ",
-        check->var[0] ? check->var : "AUTOTEST_ACTUAL",
-        " ",
-        match_name(check->match),
-        " ",
-        expected
-    };
-    size_t rpos = 0;
-    for (size_t i = 0; i < sizeof(parts) / sizeof(parts[0]); i++) {
-        for (const char *s = parts[i]; *s && rpos + 1 < sizeof(replacement); s++) {
-            replacement[rpos++] = *s;
-        }
-    }
-    replacement[rpos] = '\0';
-    const char *p = tc->command;
+static bool next_check_directive(const char **cursor, CheckRule *out) {
+    const char *p = cursor ? *cursor : NULL;
     while (p && *p) {
         const char *end = strchr(p, '\n');
         size_t len = end ? (size_t)(end - p) : strlen(p);
-        char directive_arg[LONG_LEN];
-        const char *src = p;
-        size_t src_len = len;
-        if (!replaced && line_starts_directive(p, len, "@check", directive_arg, sizeof(directive_arg))) {
-            src = replacement;
-            src_len = strlen(replacement);
-            replaced = true;
+        char arg[LONG_LEN];
+        if (line_starts_directive(p, len, "@check", arg, sizeof(arg))) {
+            char heredoc_delim[TEXT_LEN];
+            if (parse_check_arg(arg, out, heredoc_delim, sizeof(heredoc_delim))) {
+                const char *next = end ? end + 1 : NULL;
+                if (heredoc_delim[0]) {
+                    collect_check_heredoc(next, heredoc_delim, out->expected, sizeof(out->expected), &next);
+                }
+                *cursor = next;
+                return true;
+            }
         }
-        if (pos + src_len + (end ? 1 : 0) + 1 >= sizeof(updated)) return;
-        memcpy(updated + pos, src, src_len);
-        pos += src_len;
-        if (end) updated[pos++] = '\n';
         p = end ? end + 1 : NULL;
     }
-    if (replaced) {
-        updated[pos] = '\0';
-        copy_text(tc->command, sizeof(tc->command), updated);
+    if (cursor) *cursor = NULL;
+    return false;
+}
+
+static int command_check_count(const char *command) {
+    int count = 0;
+    const char *cursor = command;
+    CheckRule check;
+    while (next_check_directive(&cursor, &check)) count++;
+    return count;
+}
+
+static bool legacy_primary_check_enabled(const TestCase *tc) {
+    return tc &&
+           command_check_count(tc->command) == 0 &&
+           tc->check_count > 0 &&
+           tc->checks[0].var[0] &&
+           tc->checks[0].match != MATCH_NONE;
+}
+
+static bool next_effective_check(const TestCase *tc, const char **cursor, CheckRule *out, bool *used_legacy) {
+    if (next_check_directive(cursor, out)) return true;
+    if (used_legacy && !*used_legacy && legacy_primary_check_enabled(tc)) {
+        *out = tc->checks[0];
+        *used_legacy = true;
+        return true;
     }
+    return false;
 }
 
 static void auto_configure_test(TestCase *tc) {
-    (void)primary_check(tc);
     collect_check_directives(tc);
     tc->cleanup[0] = '\0';
     collect_temp_paths(tc, "/tmp/");
@@ -1080,12 +1211,13 @@ static int write_single_test_script(TestCase *tc) {
     fprintf(f, "RESULT_FILE=\"${SELF_PATH%%.sh}.result\"\n\n");
     fprintf(f, "MODE=run\n");
     fprintf(f, "DETAIL_RESULT_FILE=\"\"\n");
-    fprintf(f, "usage() { echo \"Usage: $0 [--detail-result PATH]\"; echo \"       $0 --resume\"; }\n");
+    fprintf(f, "DETAIL_STDOUT=0\n");
+    fprintf(f, "usage() { echo \"Usage: $0 [--detail [PATH]]\"; echo \"       $0 --resume\"; }\n");
     fprintf(f, "while [ \"$#\" -gt 0 ]; do\n");
     fprintf(f, "  case \"$1\" in\n");
     fprintf(f, "    --resume) MODE=--resume; shift ;;\n");
-    fprintf(f, "    --detail-result) shift; if [ \"$#\" -eq 0 ]; then usage >&2; echo '[NG] --detail-result requires a path' >&2; exit 2; fi; DETAIL_RESULT_FILE=\"$1\"; shift ;;\n");
-    fprintf(f, "    --detail-result=*) DETAIL_RESULT_FILE=\"${1#--detail-result=}\"; shift ;;\n");
+    fprintf(f, "    --detail) shift; if [ \"$#\" -gt 0 ] && [ \"${1#-}\" = \"$1\" ]; then DETAIL_RESULT_FILE=\"$1\"; shift; else DETAIL_STDOUT=1; fi ;;\n");
+    fprintf(f, "    --detail=*) DETAIL_RESULT_FILE=\"${1#--detail=}\"; shift ;;\n");
     fprintf(f, "    --help) usage; exit 0 ;;\n");
     fprintf(f, "    --*) usage >&2; echo \"[NG] unknown option: $1\" >&2; exit 2 ;;\n");
     fprintf(f, "    *) usage >&2; echo \"[NG] unexpected argument: $1\" >&2; exit 2 ;;\n");
@@ -1185,21 +1317,21 @@ static void save_test_registry(const Project *p) {
     for (int i = 0; i < p->case_count; i++) {
         const TestCase *tc = &p->cases[i];
         if (!tc->script_path[0]) continue;
-        char fields[6 + MAX_CHECKS * 3 + 1][LONG_LEN];
+        char fields[6 + LEGACY_REGISTRY_CHECKS * 3 + 1][LONG_LEN];
         escape_field(fields[0], sizeof(fields[0]), tc->script_path);
         escape_field(fields[1], sizeof(fields[1]), tc->title);
         snprintf(fields[2], sizeof(fields[2]), "%d", tc->selected ? 1 : 0);
         escape_field(fields[3], sizeof(fields[3]), command_kind_name(tc->kind));
         snprintf(fields[4], sizeof(fields[4]), "%d", tc->expected_exit);
-        snprintf(fields[5], sizeof(fields[5]), "%d", tc->check_count > 0 ? tc->check_count : 1);
-        for (int c = 0; c < MAX_CHECKS; c++) {
+        snprintf(fields[5], sizeof(fields[5]), "%d", tc->check_count);
+        for (int c = 0; c < LEGACY_REGISTRY_CHECKS; c++) {
             int base = 6 + c * 3;
             escape_field(fields[base], sizeof(fields[base]), tc->checks[c].var);
             escape_field(fields[base + 1], sizeof(fields[base + 1]), match_name(tc->checks[c].match));
             escape_field(fields[base + 2], sizeof(fields[base + 2]), tc->checks[c].expected);
         }
-        escape_field(fields[6 + MAX_CHECKS * 3], sizeof(fields[6 + MAX_CHECKS * 3]), tc->command);
-        for (int c = 0; c < 6 + MAX_CHECKS * 3 + 1; c++) {
+        escape_field(fields[6 + LEGACY_REGISTRY_CHECKS * 3], sizeof(fields[6 + LEGACY_REGISTRY_CHECKS * 3]), tc->command);
+        for (int c = 0; c < 6 + LEGACY_REGISTRY_CHECKS * 3 + 1; c++) {
             if (c) fputc('\t', f);
             fputs(fields[c], f);
         }
@@ -1245,8 +1377,8 @@ static bool load_test_registry(Project *p) {
         if (field_count >= 19) {
             tc->check_count = atoi(fields[5]);
             if (tc->check_count < 1) tc->check_count = 1;
-            if (tc->check_count > MAX_CHECKS) tc->check_count = MAX_CHECKS;
-            for (int c = 0; c < MAX_CHECKS; c++) {
+            if (tc->check_count > LEGACY_REGISTRY_CHECKS) tc->check_count = LEGACY_REGISTRY_CHECKS;
+            for (int c = 0; c < LEGACY_REGISTRY_CHECKS; c++) {
                 int base = 6 + c * 3;
                 unescape_field(tc->checks[c].var, sizeof(tc->checks[c].var), fields[base]);
                 tc->checks[c].match = parse_match(fields[base + 1]);
@@ -1267,6 +1399,12 @@ static bool load_test_registry(Project *p) {
         }
         tc->timeout_sec = 30;
         if (!tc->title[0]) copy_text(tc->title, sizeof(tc->title), tc->script_path);
+        if (command_check_count(tc->command) > 0) {
+            collect_check_directives(tc);
+        } else if (tc->checks[0].match == MATCH_NONE) {
+            tc->check_count = 0;
+            memset(tc->checks, 0, sizeof(tc->checks));
+        }
         if (tc->kind != CMD_REBOOT && file_contains_reboot(tc->script_path)) tc->kind = CMD_REBOOT;
         p->case_count++;
     }
@@ -1376,18 +1514,19 @@ static void draw_case_details(const App *app, int y, int x, int h, int w) {
     draw_box(y, x, h, w, "Details");
     if (app->project.case_count == 0) return;
     const TestCase *tc = &app->project.cases[app->selected_case];
-    const CheckRule *check = primary_check_const(tc);
-    char check_summary[LONG_LEN];
-    summarize_multiline(check_summary, sizeof(check_summary), check ? check->expected : "");
+    int check_count = command_check_count(tc->command);
     mvprintw(y + 1, x + 1, "id: %s", tc->id);
     mvprintw(y + 2, x + 1, "title: %.*s", w - 9, tc->title);
     mvprintw(y + 3, x + 1, "kind: %s  selected: %s", command_kind_name(tc->kind), tc->selected ? "yes" : "no");
     mvprintw(y + 4, x + 1, "expected_exit: %d", tc->expected_exit);
-    mvprintw(y + 5, x + 1, "checks: %d  primary: %.*s", tc->check_count, w - 25, check ? check->var : "AUTOTEST_ACTUAL");
-    mvprintw(y + 6, x + 1, "check: %s %.*s", match_name(check ? check->match : MATCH_NONE), w - 16, check_summary);
-    mvprintw(y + 7, x + 1, "cleanup: auto %s", tc->cleanup[0] ? "generated" : "none");
-    mvprintw(y + 8, x + 1, "reboot: auto %s", tc->kind == CMD_REBOOT ? "detected" : "none");
-    mvprintw(y + 9, x + 1, "path: %.*s", w - 8, tc->script_path[0] ? tc->script_path : "<not saved>");
+    mvprintw(y + 5, x + 1, "checks: %d from @check lines", check_count);
+    mvprintw(y + 6, x + 1, "@check <var> <match> <expected>");
+    mvprintw(y + 7, x + 3, "exact: regex full match");
+    mvprintw(y + 8, x + 3, "contains: regex search");
+    mvprintw(y + 9, x + 3, "empty: no text  not_empty: any text");
+    mvprintw(y + 10, x + 1, "cleanup: auto %s", tc->cleanup[0] ? "generated" : "none");
+    mvprintw(y + 11, x + 1, "reboot: auto %s", tc->kind == CMD_REBOOT ? "detected" : "none");
+    mvprintw(y + 12, x + 1, "path: %.*s", w - 8, tc->script_path[0] ? tc->script_path : "<not saved>");
 }
 
 static void draw_dashboard(const App *app, int height, int width) {
@@ -1423,8 +1562,8 @@ static void draw_editor(const App *app, int height, int width) {
     if (has_reboot(&app->project)) {
         mvprintw(bottom + 2, 1, "selected reboot tests may interrupt sequential execution");
     }
-    static const char *menu[] = {"Edit test", "Rename test", "Copy test", "Select test", "Delete test", "Variable match", "Preview selected", "Start selected tests", "Back"};
-    draw_menu(height - 4, 1, width - 2, menu, 9, app->selected_menu);
+    static const char *menu[] = {"Edit test", "Rename test", "Copy test", "Select test", "Delete test", "Preview selected", "Start selected tests", "Back"};
+    draw_menu(height - 4, 1, width - 2, menu, 8, app->selected_menu);
 }
 
 static void draw_form(const App *app, int height, int width) {
@@ -1461,23 +1600,19 @@ static void draw_form(const App *app, int height, int width) {
 
 static void draw_match(const App *app, int height, int width) {
     draw_header(app, width);
-    draw_box(3, 0, height - 7, width, "Variable Match Builder");
+    draw_box(3, 0, height - 7, width, "@check Reference");
     if (app->project.case_count == 0) return;
     const TestCase *tc = &app->project.cases[app->selected_case];
-    const CheckRule *check = primary_check_const(tc);
-    char check_summary[LONG_LEN];
-    summarize_multiline(check_summary, sizeof(check_summary), check ? check->expected : "");
-    mvprintw(5, 2, "primary variable: %.*s", width - 20, check ? check->var : "AUTOTEST_ACTUAL");
-    mvprintw(6, 2, "checks: %d/%d  match: %-10s expected: %.*s", tc->check_count, MAX_CHECKS, match_name(check ? check->match : MATCH_NONE), width - 50, check_summary);
-    mvprintw(8, 2, "Match types:");
-    mvprintw(9, 4, "none       no variable check");
-    mvprintw(10, 4, "exact      output must be identical");
-    mvprintw(11, 4, "contains   output must contain expected text");
-    mvprintw(12, 4, "regex      output must match expected regular expression");
-    mvprintw(13, 4, "empty      output must be empty");
-    mvprintw(14, 4, "not_empty  output must not be empty");
-    static const char *menu[] = {"Set variable", "Set match", "Set expected", "Back"};
-    draw_menu(height - 4, 1, width - 2, menu, 4, app->selected_menu);
+    int check_count = command_check_count(tc->command);
+    mvprintw(5, 2, "checks: %d from script @check lines", check_count);
+    mvprintw(6, 2, "@check <var> <match> <expected>");
+    mvprintw(7, 4, "exact      expected regex must match the whole value");
+    mvprintw(8, 4, "contains   expected regex must match somewhere");
+    mvprintw(9, 4, "empty      variable value must be empty");
+    mvprintw(10, 4, "not_empty  variable value must not be empty");
+    mvprintw(12, 4, "none       no variable check");
+    static const char *menu[] = {"Back"};
+    draw_menu(height - 4, 1, width - 2, menu, 1, app->selected_menu);
 }
 
 static void draw_cleanup(const App *app, int height, int width) {
@@ -1674,32 +1809,70 @@ static void draw_preview(App *app, int height, int width) {
     draw_menu(height - 4, 1, width - 2, menu, 6, app->selected_menu);
 }
 
+static bool selected_result_path(char *out, size_t out_sz) {
+    char cwd[LONG_LEN];
+    if (!getcwd(cwd, sizeof(cwd))) return false;
+    if (strlen(cwd) + strlen("/autotest_selected.result") + 1 > out_sz) return false;
+    snprintf(out, out_sz, "%s/autotest_selected.result", cwd);
+    return true;
+}
+
 static void draw_result(const App *app, int height, int width) {
     draw_header(app, width);
-    draw_box(3, 0, height - 7, width, "Saved Test Scripts");
+    draw_box(3, 0, height - 7, width, "Selected Test Results");
     int y = 5;
-    for (int i = 0; i < app->project.case_count && y < height - 8; i++) {
-        const TestCase *tc = &app->project.cases[i];
-        if (!tc->selected) continue;
-        mvprintw(y++, 2, "[%s] %s %s", tc->script_path[0] ? "OK" : "NG", tc->id, tc->title);
-        if (tc->script_path[0] && y < height - 8) {
-            print_clip(y++, 6, width - 8, tc->script_path);
+    char result_path[LONG_LEN];
+    if (selected_result_path(result_path, sizeof(result_path))) {
+        mvprintw(y++, 2, "result: %.*s", width - 12, result_path);
+        FILE *f = fopen(result_path, "r");
+        if (f) {
+            char line[LONG_LEN];
+            while (y < height - 8 && fgets(line, sizeof(line), f)) {
+                size_t len = strlen(line);
+                while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r')) line[--len] = '\0';
+                print_clip(y++, 2, width - 4, line);
+            }
+            fclose(f);
+        } else {
+            mvprintw(y++, 2, "No selected test result has been written yet.");
+            for (int i = 0; i < app->project.case_count && y < height - 8; i++) {
+                const TestCase *tc = &app->project.cases[i];
+                if (!tc->selected) continue;
+                mvprintw(y++, 2, "[SAVED] %s %s", tc->id, tc->title);
+                if (tc->script_path[0] && y < height - 8) print_clip(y++, 6, width - 8, tc->script_path);
+            }
         }
+    } else {
+        mvprintw(y++, 2, "Failed to resolve selected result path.");
     }
-    mvprintw(height - 8, 2, "Selected tests are executed sequentially by these saved paths.");
+    mvprintw(height - 8, 2, "Start selected tests writes one aggregate result file in the current directory.");
     static const char *menu[] = {"Back to tests", "Preview selected", "Dashboard"};
     draw_menu(height - 4, 1, width - 2, menu, 3, app->selected_menu);
 }
 
 static void draw_confirm(const App *app, int height, int width) {
     draw_header(app, width);
-    draw_box(4, 4, height - 9, width - 8, "Confirm Script Generation");
-    mvprintw(6, 6, "Selected test scripts may contain risky commands.");
-    if (has_reboot(&app->project)) mvprintw(8, 8, "- reboot");
-    for (int i = 0; i < app->project.cleanup_count && i < 4; i++) {
-        mvprintw(9 + i, 8, "- cleanup: %.*s", width - 22, app->project.cleanups[i]);
+    draw_box(4, 4, height - 9, width - 8,
+             app->confirm_action == CONFIRM_DELETE ? "Confirm Delete Test" : "Confirm Script Generation");
+    if (app->confirm_action == CONFIRM_DELETE) {
+        if (app->project.case_count == 0) {
+            mvprintw(6, 6, "No test case to delete.");
+        } else {
+            const TestCase *tc = &app->project.cases[app->selected_case];
+            mvprintw(6, 6, "Delete this test case?");
+            mvprintw(8, 8, "title: %.*s", width - 18, tc->title);
+            mvprintw(9, 8, "script: %.*s", width - 19, tc->script_path[0] ? tc->script_path : "<not saved>");
+            mvprintw(11, 6, "The registry entry, script file, and result file will be removed.");
+        }
+        mvprintw(height - 9, 6, "Delete selected test?");
+    } else {
+        mvprintw(6, 6, "Selected test scripts may contain risky commands.");
+        if (has_reboot(&app->project)) mvprintw(8, 8, "- reboot");
+        for (int i = 0; i < app->project.cleanup_count && i < 4; i++) {
+            mvprintw(9 + i, 8, "- cleanup: %.*s", width - 22, app->project.cleanups[i]);
+        }
+        mvprintw(height - 9, 6, app->run_after_generate ? "Start selected tests?" : "Save selected test scripts?");
     }
-    mvprintw(height - 9, 6, app->run_after_generate ? "Start selected tests?" : "Save selected test scripts?");
     static const char *menu[] = {"Continue", "Back"};
     draw_menu(height - 7, 6, width - 12, menu, 2, app->selected_menu);
 }
@@ -1765,7 +1938,7 @@ static int prompt_int(const char *label, int current) {
 }
 
 static void cycle_match(MatchType *m) {
-    *m = (MatchType)((*m + 1) % 6);
+    *m = (MatchType)((*m + 1) % 5);
 }
 
 static void cycle_kind(TestCase *tc) {
@@ -1796,9 +1969,8 @@ static void quote_for_printf(char *dst, size_t dst_sz, const char *src) {
 static void set_reboot_command(TestCase *tc) {
     tc->kind = CMD_REBOOT;
     tc->expected_exit = 0;
-    tc->check_count = 1;
-    copy_text(tc->checks[0].var, sizeof(tc->checks[0].var), "AUTOTEST_ACTUAL");
-    tc->checks[0].match = MATCH_NONE;
+    tc->check_count = 0;
+    memset(tc->checks, 0, sizeof(tc->checks));
     copy_text(tc->command, sizeof(tc->command), "__AUTOTEST_REBOOT__");
 }
 
@@ -1816,9 +1988,8 @@ static void set_vim_command(TestCase *tc) {
              qtext, qpath);
     tc->kind = CMD_VIM;
     tc->expected_exit = 0;
-    tc->check_count = 1;
-    copy_text(tc->checks[0].var, sizeof(tc->checks[0].var), "AUTOTEST_ACTUAL");
-    tc->checks[0].match = MATCH_NONE;
+    tc->check_count = 0;
+    memset(tc->checks, 0, sizeof(tc->checks));
 }
 
 static void editor_save_undo(App *app) {
@@ -1866,14 +2037,31 @@ static void editor_newline(App *app) {
     char *line = app->editor_lines[app->editor_row];
     int len = (int)strlen(line);
     if (app->editor_col > len) app->editor_col = len;
+    int indent_len = 0;
+    while (line[indent_len] == ' ' || line[indent_len] == '\t') indent_len++;
     for (int r = app->editor_line_count; r > app->editor_row + 1; r--) {
         copy_text(app->editor_lines[r], EDITOR_COLS, app->editor_lines[r - 1]);
     }
-    copy_text(app->editor_lines[app->editor_row + 1], EDITOR_COLS, line + app->editor_col);
+    char next_line[EDITOR_COLS];
+    int pos = 0;
+    int copy_indent = indent_len;
+    if (copy_indent > EDITOR_COLS - 1) copy_indent = EDITOR_COLS - 1;
+    if (copy_indent > 0) {
+        memcpy(next_line, line, (size_t)copy_indent);
+        pos = copy_indent;
+    }
+    size_t suffix_len = strlen(line + app->editor_col);
+    if (pos + (int)suffix_len >= EDITOR_COLS) suffix_len = (size_t)(EDITOR_COLS - pos - 1);
+    if (suffix_len > 0) {
+        memcpy(next_line + pos, line + app->editor_col, suffix_len);
+        pos += (int)suffix_len;
+    }
+    next_line[pos] = '\0';
+    copy_text(app->editor_lines[app->editor_row + 1], EDITOR_COLS, next_line);
     line[app->editor_col] = '\0';
     app->editor_line_count++;
     app->editor_row++;
-    app->editor_col = 0;
+    app->editor_col = copy_indent;
 }
 
 static void editor_backspace(App *app) {
@@ -2371,9 +2559,7 @@ static void add_case(App *app) {
     new_case.kind = CMD_SHELL;
     new_case.selected = true;
     new_case.expected_exit = 0;
-    new_case.check_count = 1;
-    copy_text(new_case.checks[0].var, sizeof(new_case.checks[0].var), "AUTOTEST_ACTUAL");
-    new_case.checks[0].match = MATCH_NONE;
+    new_case.check_count = 0;
     new_case.timeout_sec = 30;
     if (!prompt_text("test title", new_case.title, sizeof(new_case.title))) {
         set_status(app, "Canceled test title.");
@@ -2523,9 +2709,8 @@ static void write_match_function(FILE *f) {
     fputs("  expected=\"$3\"\n", f);
     fputs("  case \"$type\" in\n", f);
     fputs("    none) return 0 ;;\n", f);
-    fputs("    exact) [ \"$actual\" = \"$expected\" ] ;;\n", f);
-    fputs("    contains) case \"$actual\" in *\"$expected\"*) return 0 ;; *) return 1 ;; esac ;;\n", f);
-    fputs("    regex) printf '%s\\n' \"$actual\" | grep -Eq -- \"$expected\" ;;\n", f);
+    fputs("    exact) AUTOTEST_MATCH_ACTUAL=\"$actual\" AUTOTEST_MATCH_EXPECTED=\"$expected\" awk 'BEGIN { pattern = \"^(\" ENVIRON[\"AUTOTEST_MATCH_EXPECTED\"] \")$\"; exit(ENVIRON[\"AUTOTEST_MATCH_ACTUAL\"] ~ pattern ? 0 : 1) }' ;;\n", f);
+    fputs("    contains) AUTOTEST_MATCH_ACTUAL=\"$actual\" AUTOTEST_MATCH_EXPECTED=\"$expected\" awk 'BEGIN { exit(ENVIRON[\"AUTOTEST_MATCH_ACTUAL\"] ~ ENVIRON[\"AUTOTEST_MATCH_EXPECTED\"] ? 0 : 1) }' ;;\n", f);
     fputs("    empty) [ -z \"$actual\" ] ;;\n", f);
     fputs("    not_empty) [ -n \"$actual\" ] ;;\n", f);
     fputs("    *) return 1 ;;\n", f);
@@ -2554,42 +2739,120 @@ static void write_match_function(FILE *f) {
     fputs("  input=\"$1\"\n", f);
     fputs("  output=\"$2\"\n", f);
     fputs("  if command -v perl >/dev/null 2>&1; then\n", f);
-    fputs("    perl -pe 's/\\e\\[[0-?]*[ -\\/]*[@-~]//g; s/\\e\\][^\\a]*(?:\\a|\\e\\\\)//g; s/\\r/\\n/g; s/[\\x00-\\x08\\x0B\\x0C\\x0E-\\x1F\\x7F]//g' \"$input\" >\"$output\"\n", f);
+    fputs("    perl -0pe 's/^Script started on .*?\\n//s; s/\\n?Script done on .*?\\n?\\z//s; s/\\e\\[\\?(?:1049|1047|47)h.*?\\e\\[\\?(?:1049|1047|47)l//gs; s/\\e\\[[0-?]*[ -\\/]*[@-~]//g; s/\\e\\][^\\a]*(?:\\a|\\e\\\\)//g; s/\\r+\\n/\\n/g; s/\\r/\\n/g; s/[\\x00-\\x08\\x0B\\x0C\\x0E-\\x1F\\x7F]//g' \"$input\" >\"$output\"\n", f);
     fputs("  else\n", f);
-    fputs("    sed -r 's/\\x1B\\[[0-?]*[ -\\/]*[@-~]//g' \"$input\" | tr '\\r' '\\n' | tr -d '\\000-\\010\\013\\014\\016-\\037\\177' >\"$output\"\n", f);
+    fputs("    sed -r '/^Script started on /d; /^Script done on /d; s/\\x1B\\[[0-?]*[ -\\/]*[@-~]//g; s/\\r$//g' \"$input\" | tr '\\r' '\\n' | tr -d '\\000-\\010\\013\\014\\016-\\037\\177' >\"$output\"\n", f);
     fputs("  fi\n", f);
+    fputs("}\n\n", f);
+    fputs("autotest_strip_tui_echo() {\n", f);
+    fputs("  output=\"$1\"\n", f);
+    fputs("  input=\"$2\"\n", f);
+    fputs("  [ -f \"$output\" ] || return 0\n", f);
+    fputs("  [ -f \"$input\" ] || return 0\n", f);
+    fputs("  output_text=$(cat \"$output\" 2>/dev/null || true)\n", f);
+    fputs("  input_text=$(cat \"$input\" 2>/dev/null || true)\n", f);
+    fputs("  if command -v perl >/dev/null 2>&1; then\n", f);
+    fputs("    perl -0777 -e 'my ($out_path,$in_path)=@ARGV; open my $ofh,\"<\",$out_path or exit 0; local $/; my $out=readline($ofh); open my $ifh,\"<\",$in_path or exit 0; my $in=readline($ifh); if (length($in) && index($out,$in)==0) { $out=substr($out,length($in)); $out =~ s/^\\n+//; open my $wfh,\">\",$out_path or exit 0; print {$wfh} $out; }' \"$output\" \"$input\"\n", f);
+    fputs("  elif [ -n \"$input_text\" ] && [ \"$output_text\" = \"$input_text\" ]; then\n", f);
+    fputs("    : >\"$output\"\n", f);
+    fputs("  fi\n", f);
+    fputs("}\n\n", f);
+    fputs("autotest_detail_cat() {\n", f);
+    fputs("  local path=\"$1\"\n", f);
+    fputs("  [ -n \"$path\" ] && [ -f \"$path\" ] || return 0\n", f);
+    fputs("  if [ \"${AUTOTEST_DETAIL_SAFE:-0}\" = 1 ]; then\n", f);
+    fputs("    cat -v \"$path\" 2>/dev/null || true\n", f);
+    fputs("  else\n", f);
+    fputs("    cat \"$path\"\n", f);
+    fputs("  fi\n", f);
+    fputs("}\n\n", f);
+    fputs("autotest_detail_kv() {\n", f);
+    fputs("  local key=\"$1\"\n", f);
+    fputs("  local value=\"$2\"\n", f);
+    fputs("  if [ \"${AUTOTEST_DETAIL_COLOR:-0}\" = 1 ]; then\n", f);
+    fputs("    printf '\\033[36m%s\\033[0m=%s\\n' \"$key\" \"$value\"\n", f);
+    fputs("  else\n", f);
+    fputs("    printf '%s=%s\\n' \"$key\" \"$value\"\n", f);
+    fputs("  fi\n", f);
+    fputs("}\n\n", f);
+    fputs("autotest_detail_value() {\n", f);
+    fputs("  local key=\"$1\"\n", f);
+    fputs("  local value=\"$2\"\n", f);
+    fputs("  if [ \"${AUTOTEST_DETAIL_COLOR:-0}\" = 1 ]; then\n", f);
+    fputs("    printf '\\033[36m%s\\033[0m:\\n' \"$key\"\n", f);
+    fputs("    printf '%s\\n' \"$value\" | cat -v\n", f);
+    fputs("  else\n", f);
+    fputs("    printf '%s=%s\\n' \"$key\" \"$value\"\n", f);
+    fputs("  fi\n", f);
+    fputs("}\n\n", f);
+    fputs("autotest_detail_section() {\n", f);
+    fputs("  if [ \"${AUTOTEST_DETAIL_COLOR:-0}\" = 1 ]; then\n", f);
+    fputs("    printf '\\033[33m%s\\033[0m\\n' \"$1\"\n", f);
+    fputs("  else\n", f);
+    fputs("    echo \"$1\"\n", f);
+    fputs("  fi\n", f);
+    fputs("}\n\n", f);
+    fputs("autotest_emit_detail_result() {\n", f);
+    fputs("  {\n", f);
+    fputs("    echo \"${status_msg-}\"\n", f);
+    fputs("    echo \"Summary: total=$TOTAL_COUNT OK=$OK_COUNT NG=$NG_COUNT\"\n", f);
+    fputs("    autotest_detail_kv expected_exit \"${expected_exit-}\"\n", f);
+    fputs("    autotest_detail_kv actual_exit \"${actual_exit-}\"\n", f);
+    fputs("    autotest_detail_kv ok \"${ok-}\"\n", f);
+    fputs("    autotest_detail_kv check_count \"${check_count:-0}\"\n", f);
+    fputs("    i=1\n", f);
+    fputs("    while [ \"$i\" -le \"${check_count:-0}\" ]; do\n", f);
+    fputs("      name_ref=\"check_var_$i\"\n", f);
+    fputs("      match_ref=\"check_match_$i\"\n", f);
+    fputs("      expected_ref=\"expected_value_$i\"\n", f);
+    fputs("      value_ref=\"actual_value_$i\"\n", f);
+    fputs("      name=\"${!name_ref}\"\n", f);
+    fputs("      match=\"${!match_ref}\"\n", f);
+    fputs("      expected=\"${!expected_ref}\"\n", f);
+    fputs("      value=\"${!value_ref}\"\n", f);
+    fputs("      autotest_detail_kv \"check_$i\" \"$name\"\n", f);
+    fputs("      autotest_detail_kv \"match_$i\" \"$match\"\n", f);
+    fputs("      if [ \"${AUTOTEST_DETAIL_SAFE:-0}\" = 1 ]; then\n", f);
+    fputs("        autotest_detail_value \"expected $name\" \"$expected\"\n", f);
+    fputs("        autotest_detail_value \"actual $name\" \"$value\"\n", f);
+    fputs("      else\n", f);
+    fputs("        autotest_detail_kv \"expected_$i\" \"$expected\"\n", f);
+    fputs("        autotest_detail_kv \"actual_$i\" \"$value\"\n", f);
+    fputs("      fi\n", f);
+    fputs("      i=$((i + 1))\n", f);
+    fputs("    done\n", f);
+    fputs("    if [ \"${AUTOTEST_DETAIL_SAFE:-0}\" != 1 ]; then\n", f);
+    fputs("      autotest_detail_kv actual_dir \"${actual_dir-}\"\n", f);
+    fputs("      autotest_detail_kv tui_text_file \"${AUTOTEST_TUI_TEXT_FILE-}\"\n", f);
+    fputs("      autotest_detail_kv tui_transcript_file \"${AUTOTEST_TUI_TRANSCRIPT_FILE-}\"\n", f);
+    fputs("      autotest_detail_kv tui_input_file \"${AUTOTEST_TUI_INPUT_FILE-}\"\n", f);
+    fputs("      autotest_detail_kv stdout_file \"${stdout_file-}\"\n", f);
+    fputs("      autotest_detail_kv stderr_file \"${stderr_file-}\"\n", f);
+    fputs("      autotest_detail_section '--- tui text ---'\n", f);
+    fputs("      autotest_detail_cat \"${AUTOTEST_TUI_TEXT_FILE-}\"\n", f);
+    fputs("      autotest_detail_section '--- tui transcript ---'\n", f);
+    fputs("      autotest_detail_cat \"${AUTOTEST_TUI_TRANSCRIPT_FILE-}\"\n", f);
+    fputs("      autotest_detail_section '--- stdout ---'\n", f);
+    fputs("      autotest_detail_cat \"${stdout_file-}\"\n", f);
+    fputs("      autotest_detail_section '--- stderr ---'\n", f);
+    fputs("      autotest_detail_cat \"${stderr_file-}\"\n", f);
+    fputs("    else\n", f);
+    fputs("      if [ -n \"${stdout_file-}\" ] && [ -s \"$stdout_file\" ]; then autotest_detail_section '--- stdout ---'; autotest_detail_cat \"$stdout_file\"; fi\n", f);
+    fputs("      if [ -n \"${stderr_file-}\" ] && [ -s \"$stderr_file\" ]; then autotest_detail_section '--- stderr ---'; autotest_detail_cat \"$stderr_file\"; fi\n", f);
+    fputs("    fi\n", f);
+    fputs("  }\n", f);
     fputs("}\n\n", f);
     fputs("autotest_write_detail_result() {\n", f);
     fputs("  detail_file=\"$1\"\n", f);
     fputs("  [ -n \"$detail_file\" ] || return 0\n", f);
+    fputs("  if [ \"$detail_file\" = - ]; then AUTOTEST_DETAIL_SAFE=1 AUTOTEST_DETAIL_COLOR=1 autotest_emit_detail_result; return 0; fi\n", f);
     fputs("  detail_dir=$(dirname \"$detail_file\" 2>/dev/null || echo .)\n", f);
     fputs("  mkdir -p \"$detail_dir\" 2>/dev/null || true\n", f);
-    fputs("  {\n", f);
-    fputs("    echo \"${status_msg-}\"\n", f);
-    fputs("    echo \"Summary: total=$TOTAL_COUNT OK=$OK_COUNT NG=$NG_COUNT\"\n", f);
-    fputs("    echo \"expected_exit=${expected_exit-}\"\n", f);
-    fputs("    echo \"actual_exit=${actual_exit-}\"\n", f);
-    fputs("    echo \"ok=${ok-}\"\n", f);
-    fputs("    echo \"check_count=${check_count:-0}\"\n", f);
-    fputs("    i=1\n", f);
-    fputs("    while [ \"$i\" -le \"${check_count:-0}\" ]; do\n", f);
-    fputs("      eval \"name=\\${check_var_$i-}\"\n", f);
-    fputs("      eval \"value=\\${actual_value_$i-}\"\n", f);
-    fputs("      echo \"check_$i=$name\"\n", f);
-    fputs("      echo \"actual_$i=$value\"\n", f);
-    fputs("      i=$((i + 1))\n", f);
-    fputs("    done\n", f);
-    fputs("    echo \"actual_dir=${actual_dir-}\"\n", f);
-    fputs("    echo \"tui_text_file=${AUTOTEST_TUI_TEXT_FILE-}\"\n", f);
-    fputs("    echo \"stdout_file=${stdout_file-}\"\n", f);
-    fputs("    echo \"stderr_file=${stderr_file-}\"\n", f);
-    fputs("    echo '--- tui text ---'\n", f);
-    fputs("    [ -n \"${AUTOTEST_TUI_TEXT_FILE-}\" ] && [ -f \"$AUTOTEST_TUI_TEXT_FILE\" ] && cat \"$AUTOTEST_TUI_TEXT_FILE\"\n", f);
-    fputs("    echo '--- stdout ---'\n", f);
-    fputs("    [ -n \"${stdout_file-}\" ] && [ -f \"$stdout_file\" ] && cat \"$stdout_file\"\n", f);
-    fputs("    echo '--- stderr ---'\n", f);
-    fputs("    [ -n \"${stderr_file-}\" ] && [ -f \"$stderr_file\" ] && cat \"$stderr_file\"\n", f);
-    fputs("  } >\"$detail_file\"\n", f);
+    fputs("  autotest_emit_detail_result >\"$detail_file\"\n", f);
+    fputs("}\n\n", f);
+    fputs("autotest_write_detail_outputs() {\n", f);
+    fputs("  autotest_write_detail_result \"$DETAIL_RESULT_FILE\"\n", f);
+    fputs("  [ \"${DETAIL_STDOUT:-0}\" = 1 ] && autotest_write_detail_result -\n", f);
     fputs("}\n\n", f);
 }
 
@@ -2605,35 +2868,60 @@ static void write_rescue_continue(FILE *f, const char *indent) {
 }
 
 static void write_capture_checks(FILE *f, const TestCase *tc, const char *indent, const char *dir_expr) {
-    int count = tc->check_count > 0 ? tc->check_count : 1;
-    for (int i = 0; i < count && i < MAX_CHECKS; i++) {
-        const CheckRule *check = &tc->checks[i];
-        const char *var = check->var[0] ? check->var : "AUTOTEST_ACTUAL";
-        fprintf(f, "%sprintf '%%s' \"${%s-}\" >\"%s/actual_%d\"\n", indent, var, dir_expr, i + 1);
+    int count = 0;
+    const char *cursor = tc->command;
+    bool used_legacy = false;
+    CheckRule check;
+    while (next_effective_check(tc, &cursor, &check, &used_legacy)) {
+        const char *var = check.var[0] ? check.var : "AUTOTEST_ACTUAL";
+        count++;
+        fprintf(f, "%sprintf '%%s' \"${%s-}\" >\"%s/actual_%d\"\n", indent, var, dir_expr, count);
     }
 }
 
 static void write_validate_checks(FILE *f, const TestCase *tc, const char *indent, const char *dir_expr) {
-    int count = tc->check_count > 0 ? tc->check_count : 1;
-    fprintf(f, "%scheck_count=%d\n", indent, count);
-    for (int i = 0; i < count && i < MAX_CHECKS; i++) {
-        const CheckRule *check = &tc->checks[i];
-        const char *var = check->var[0] ? check->var : "AUTOTEST_ACTUAL";
-        fprintf(f, "%scheck_var_%d=", indent, i + 1);
+    int count = 0;
+    const char *cursor = tc->command;
+    bool used_legacy = false;
+    CheckRule check;
+    while (next_effective_check(tc, &cursor, &check, &used_legacy)) {
+        const char *var = check.var[0] ? check.var : "AUTOTEST_ACTUAL";
+        count++;
+        fprintf(f, "%scheck_var_%d=", indent, count);
         shell_quote(f, var);
         fprintf(f, "\n");
-        fprintf(f, "%sactual_value_%d=$(cat \"%s/actual_%d\" 2>/dev/null || true)\n", indent, i + 1, dir_expr, i + 1);
-        fprintf(f, "%smatch_value %s \"$actual_value_%d\" ", indent, match_name(check->match), i + 1);
-        shell_quote(f, check->expected);
+        fprintf(f, "%scheck_match_%d=", indent, count);
+        shell_quote(f, match_name(check.match));
+        fprintf(f, "\n");
+        fprintf(f, "%sexpected_value_%d=", indent, count);
+        shell_quote(f, check.expected);
+        fprintf(f, "\n");
+        fprintf(f, "%sactual_value_%d=$(cat \"%s/actual_%d\" 2>/dev/null || true)\n", indent, count, dir_expr, count);
+        fprintf(f, "%smatch_value %s \"$actual_value_%d\" ", indent, match_name(check.match), count);
+        shell_quote(f, check.expected);
         fprintf(f, " || ok=0\n");
     }
+    fprintf(f, "%scheck_count=%d\n", indent, count);
+}
+
+static void write_capture_tui_metadata(FILE *f, const char *indent, const char *dir_expr) {
+    fprintf(f, "%sprintf '%%s' \"${AUTOTEST_TUI_TEXT_FILE-}\" >\"%s/tui_text_file\"\n", indent, dir_expr);
+    fprintf(f, "%sprintf '%%s' \"${AUTOTEST_TUI_TRANSCRIPT_FILE-}\" >\"%s/tui_transcript_file\"\n", indent, dir_expr);
+    fprintf(f, "%sprintf '%%s' \"${AUTOTEST_TUI_INPUT_FILE-}\" >\"%s/tui_input_file\"\n", indent, dir_expr);
+}
+
+static void write_load_tui_metadata(FILE *f, const char *indent, const char *dir_expr) {
+    fprintf(f, "%sAUTOTEST_TUI_TEXT_FILE=$(cat \"%s/tui_text_file\" 2>/dev/null || true)\n", indent, dir_expr);
+    fprintf(f, "%sAUTOTEST_TUI_TRANSCRIPT_FILE=$(cat \"%s/tui_transcript_file\" 2>/dev/null || true)\n", indent, dir_expr);
+    fprintf(f, "%sAUTOTEST_TUI_INPUT_FILE=$(cat \"%s/tui_input_file\" 2>/dev/null || true)\n", indent, dir_expr);
 }
 
 static void write_validate_check_names(FILE *f, const TestCase *tc, const char *indent) {
-    int count = tc->check_count > 0 ? tc->check_count : 1;
-    for (int i = 0; i < count && i < MAX_CHECKS; i++) {
-        const CheckRule *check = &tc->checks[i];
-        const char *var = check->var[0] ? check->var : "AUTOTEST_ACTUAL";
+    const char *cursor = tc->command;
+    bool used_legacy = false;
+    CheckRule check;
+    while (next_effective_check(tc, &cursor, &check, &used_legacy)) {
+        const char *var = check.var[0] ? check.var : "AUTOTEST_ACTUAL";
         fprintf(f, "%sif ! is_valid_var_name ", indent);
         shell_quote(f, var);
         fprintf(f, "; then status_msg='[NG] invalid check variable name'; echo \"$status_msg\"; echo \"$status_msg\" >\"$RESULT_FILE\"; NG_COUNT=$((NG_COUNT + 1)); return; fi\n");
@@ -2664,6 +2952,7 @@ static void write_case(FILE *f, const TestCase *tc, int index) {
         fprintf(f, "    ok=1\n");
         fprintf(f, "    [ \"$actual_exit\" -eq %d ] || ok=0\n", tc->expected_exit);
         write_validate_checks(f, tc, "    ", "$actual_dir");
+        write_load_tui_metadata(f, "    ", "$actual_dir");
         fprintf(f, "    systemctl disable \"$unit_name\" >/dev/null 2>&1 || true\n");
         fprintf(f, "    rm -f \"/etc/systemd/system/$unit_name\"\n");
         fprintf(f, "    systemctl daemon-reload >/dev/null 2>&1 || true\n");
@@ -2687,7 +2976,7 @@ static void write_case(FILE *f, const TestCase *tc, int index) {
         fprintf(f, "      echo \"$status_msg\"\n");
         fprintf(f, "      echo \"Summary: total=$TOTAL_COUNT OK=$OK_COUNT NG=$NG_COUNT\"\n");
         fprintf(f, "      echo \"check_count=$check_count\"\n");
-        fprintf(f, "      for i in $(seq 1 \"$check_count\"); do eval \"name=\\${check_var_$i}\"; eval \"value=\\${actual_value_$i}\"; echo \"check_$i=$name\"; echo \"actual_$i=$value\"; done\n");
+        fprintf(f, "      for i in $(seq 1 \"$check_count\"); do name_ref=\"check_var_$i\"; value_ref=\"actual_value_$i\"; name=\"${!name_ref}\"; value=\"${!value_ref}\"; echo \"check_$i=$name\"; echo \"actual_$i=$value\"; done\n");
         fprintf(f, "      echo \"actual_dir=$actual_dir\"\n");
         fprintf(f, "      echo \"stdout_file=$stdout_file\"\n");
         fprintf(f, "      echo \"stderr_file=$stderr_file\"\n");
@@ -2696,7 +2985,7 @@ static void write_case(FILE *f, const TestCase *tc, int index) {
         fprintf(f, "      echo '--- stderr ---'\n");
         fprintf(f, "      [ -f \"$stderr_file\" ] && cat \"$stderr_file\"\n");
         fprintf(f, "    } >\"$RESULT_FILE\"\n");
-        fprintf(f, "    autotest_write_detail_result \"$DETAIL_RESULT_FILE\"\n");
+        fprintf(f, "    autotest_write_detail_outputs\n");
         fprintf(f, "    rm -rf \"$state_dir\"\n");
         write_rescue_continue(f, "    ");
         fprintf(f, "  }\n");
@@ -2705,9 +2994,11 @@ static void write_case(FILE *f, const TestCase *tc, int index) {
         fprintf(f, "  mkdir -p \"$AUTOTEST_BACKUP_DIR\"\n");
         fprintf(f, "  if [ \"$mode\" = \"--resume\" ]; then\n");
         fprintf(f, "    [ -f \"$state_dir/detail_result_path\" ] && DETAIL_RESULT_FILE=$(cat \"$state_dir/detail_result_path\" 2>/dev/null || true)\n");
+        fprintf(f, "    [ -f \"$state_dir/detail_stdout\" ] && DETAIL_STDOUT=$(cat \"$state_dir/detail_stdout\" 2>/dev/null || echo 0)\n");
         fprintf(f, "  elif [ -n \"$DETAIL_RESULT_FILE\" ]; then\n");
         fprintf(f, "    printf '%%s\\n' \"$DETAIL_RESULT_FILE\" >\"$state_dir/detail_result_path\"\n");
         fprintf(f, "  fi\n");
+        fprintf(f, "  if [ \"$mode\" != \"--resume\" ] && [ \"${DETAIL_STDOUT:-0}\" = 1 ]; then printf '1\\n' >\"$state_dir/detail_stdout\"; fi\n");
         fprintf(f, "  cat >\"$state_dir/pre.sh\" <<'AUTOTEST_PRE'\n");
         write_command_phase(f, tc->command, false);
         fprintf(f, "AUTOTEST_PRE\n");
@@ -2722,6 +3013,7 @@ static void write_case(FILE *f, const TestCase *tc, int index) {
         fprintf(f, "  if [ \"$mode\" = \"--resume\" ]; then\n");
         fprintf(f, "    ( set -a; [ -f \"$state_dir/env.sh\" ] && . \"$state_dir/env.sh\"; . \"$state_dir/post.sh\"; post_rc=\"$?\"; ");
         write_capture_checks(f, tc, "", "$actual_dir");
+        write_capture_tui_metadata(f, "", "$actual_dir");
         fprintf(f, "exit \"$post_rc\" ) >>\"$stdout_file\" 2>>\"$stderr_file\"\n");
         fprintf(f, "    finish_reboot_case \"$?\"\n");
         fprintf(f, "    return\n");
@@ -2730,6 +3022,7 @@ static void write_case(FILE *f, const TestCase *tc, int index) {
         fprintf(f, "  : >\"$stderr_file\"\n");
         fprintf(f, "  ( set -a; . \"$state_dir/pre.sh\"; pre_rc=\"$?\"; ");
         write_capture_checks(f, tc, "", "$actual_dir");
+        write_capture_tui_metadata(f, "", "$actual_dir");
         fprintf(f, "export -p >\"$state_dir/env.sh\"; exit \"$pre_rc\" ) >>\"$stdout_file\" 2>>\"$stderr_file\"\n");
         fprintf(f, "  pre_exit=\"$?\"\n");
         fprintf(f, "  if [ \"$pre_exit\" -ne 0 ]; then finish_reboot_case \"$pre_exit\"; return; fi\n");
@@ -2743,10 +3036,13 @@ static void write_case(FILE *f, const TestCase *tc, int index) {
         fprintf(f, "  systemctl enable \"$unit_name\"\n");
         fprintf(f, "  bash \"$state_dir/reboot.sh\" >>\"$stdout_file\" 2>>\"$stderr_file\"\n");
         fprintf(f, "  reboot_exit=\"$?\"\n");
-        fprintf(f, "  if [ \"$reboot_exit\" -eq 0 ]; then status_msg='[PENDING] Reboot command issued. Result check will resume after boot.'; actual_exit=0; ok=0; check_count=0; echo \"$status_msg\" >\"$RESULT_FILE\"; autotest_write_detail_result \"$DETAIL_RESULT_FILE\"; echo 'Reboot command issued. Result check will resume after boot.'; exit 0; fi\n");
+        fprintf(f, "  if [ \"$reboot_exit\" -eq 0 ]; then status_msg='[PENDING] Reboot command issued. Result check will resume after boot.'; actual_exit=0; ok=0; check_count=0; ");
+        write_load_tui_metadata(f, "", "$actual_dir");
+        fprintf(f, "echo \"$status_msg\" >\"$RESULT_FILE\"; autotest_write_detail_outputs; echo 'Reboot command issued. Result check will resume after boot.'; exit 0; fi\n");
         fprintf(f, "  if [ \"$reboot_exit\" -eq 125 ]; then\n");
         fprintf(f, "    ( set -a; [ -f \"$state_dir/env.sh\" ] && . \"$state_dir/env.sh\"; . \"$state_dir/post.sh\"; post_rc=\"$?\"; ");
         write_capture_checks(f, tc, "", "$actual_dir");
+        write_capture_tui_metadata(f, "", "$actual_dir");
         fprintf(f, "exit \"$post_rc\" ) >>\"$stdout_file\" 2>>\"$stderr_file\"\n");
         fprintf(f, "    finish_reboot_case \"$?\"\n");
         fprintf(f, "    return\n");
@@ -2766,11 +3062,13 @@ static void write_case(FILE *f, const TestCase *tc, int index) {
     write_validate_check_names(f, tc, "  ");
     fprintf(f, "  ( set -a; . \"$body_file\"; body_rc=\"$?\"; ");
     write_capture_checks(f, tc, "", "$actual_dir");
+    write_capture_tui_metadata(f, "", "$actual_dir");
     fprintf(f, "exit \"$body_rc\" ) >\"$stdout_file\" 2>\"$stderr_file\"\n");
     fprintf(f, "  actual_exit=$?\n");
     fprintf(f, "  ok=1\n");
     fprintf(f, "  [ \"$actual_exit\" -eq %d ] || ok=0\n", tc->expected_exit);
     write_validate_checks(f, tc, "  ", "$actual_dir");
+    write_load_tui_metadata(f, "  ", "$actual_dir");
     fprintf(f, "  if [ \"$ok\" -eq 1 ]; then\n");
     fprintf(f, "    status_msg=");
     shell_quote(f, ok_msg);
@@ -2787,7 +3085,7 @@ static void write_case(FILE *f, const TestCase *tc, int index) {
     fprintf(f, "    echo \"     stderr: $stderr_file\"\n");
     fprintf(f, "    NG_COUNT=$((NG_COUNT + 1))\n");
     fprintf(f, "  fi\n");
-    fprintf(f, "  autotest_write_detail_result \"$DETAIL_RESULT_FILE\"\n");
+    fprintf(f, "  autotest_write_detail_outputs\n");
     if (tc->cleanup[0]) fprintf(f, "  %s || true\n", tc->cleanup);
     fprintf(f, "}\n\n");
 }
@@ -2916,6 +3214,9 @@ static int write_resume_automation(App *app, char *runner_path, size_t runner_sz
     fprintf(f, "  elif [ -n \"$result_file\" ] && [ -f \"$result_file\" ]; then\n");
     fprintf(f, "    if grep -q '^\\[NG\\]' \"$result_file\"; then failures=$((failures + 1)); fi\n");
     fprintf(f, "    log \"result: $result_file\"\n");
+    fprintf(f, "    cat \"$result_file\" >>\"$SUMMARY_PATH\"\n");
+    fprintf(f, "    echo >>\"$SUMMARY_PATH\"\n");
+    fprintf(f, "    rm -f \"$result_file\"\n");
     fprintf(f, "  else\n");
     fprintf(f, "    log \"[NG] reboot test $safe_id result file was not found\"\n");
     fprintf(f, "    failures=$((failures + 1))\n");
@@ -2943,6 +3244,7 @@ static int write_resume_automation(App *app, char *runner_path, size_t runner_sz
     fprintf(f, "    rc=$?\n");
     fprintf(f, "    if [ \"$rc\" -ne 0 ]; then\n");
     fprintf(f, "      log \"[NG] $id failed before reboot rc=$rc\"\n");
+    fprintf(f, "      if [ -f \"$result_file\" ]; then cat \"$result_file\" >>\"$SUMMARY_PATH\"; echo >>\"$SUMMARY_PATH\"; rm -f \"$result_file\"; fi\n");
     fprintf(f, "      failures=$((failures + 1))\n");
     fprintf(f, "      write_failures \"$failures\"\n");
     fprintf(f, "      rm -f \"$WAIT_SAFE_FILE\" \"$WAIT_RESULT_FILE\"\n");
@@ -2957,11 +3259,13 @@ static int write_resume_automation(App *app, char *runner_path, size_t runner_sz
     fprintf(f, "    fi\n");
     fprintf(f, "    rm -f \"$WAIT_SAFE_FILE\" \"$WAIT_RESULT_FILE\"\n");
     fprintf(f, "    if grep -q '^\\[NG\\]' \"$result_file\" 2>/dev/null; then failures=$((failures + 1)); fi\n");
+    fprintf(f, "    if [ -f \"$result_file\" ]; then cat \"$result_file\" >>\"$SUMMARY_PATH\"; echo >>\"$SUMMARY_PATH\"; rm -f \"$result_file\"; fi\n");
     fprintf(f, "    write_failures \"$failures\"\n");
     fprintf(f, "  else\n");
     fprintf(f, "    bash \"$path\"\n");
     fprintf(f, "    rc=$?\n");
     fprintf(f, "    if [ \"$rc\" -ne 0 ]; then failures=$((failures + 1)); write_failures \"$failures\"; fi\n");
+    fprintf(f, "    if [ -f \"$result_file\" ]; then cat \"$result_file\" >>\"$SUMMARY_PATH\"; echo >>\"$SUMMARY_PATH\"; rm -f \"$result_file\"; fi\n");
     fprintf(f, "  fi\n");
     fprintf(f, "  idx=$((idx + 1))\n");
     fprintf(f, "  echo \"$idx\" >\"$INDEX_FILE\"\n");
@@ -3005,6 +3309,24 @@ static int write_resume_automation(App *app, char *runner_path, size_t runner_sz
     return 0;
 }
 
+static int system_exit_code(int rc) {
+    if (rc == -1) return 127;
+    if (WIFEXITED(rc)) return WEXITSTATUS(rc);
+    if (WIFSIGNALED(rc)) return 128 + WTERMSIG(rc);
+    return 127;
+}
+
+static void append_file_to_stream(FILE *out, const char *path) {
+    FILE *in = fopen(path, "r");
+    if (!in) return;
+    char buf[4096];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), in)) > 0) {
+        fwrite(buf, 1, n, out);
+    }
+    fclose(in);
+}
+
 static void start_selected_test_scripts(App *app) {
     def_prog_mode();
     endwin();
@@ -3028,27 +3350,77 @@ static void start_selected_test_scripts(App *app) {
         refresh();
         return;
     }
+    char selected_result[LONG_LEN];
+    char output_path[LONG_LEN];
+    FILE *result = NULL;
+    int total = 0;
+    int ok_count = 0;
+    int ng_count = 0;
+    if (selected_result_path(selected_result, sizeof(selected_result))) {
+        result = fopen(selected_result, "w");
+    }
+    if (result) {
+        fprintf(result, "AutoTest selected result\n");
+        fprintf(result, "cwd=%s\n\n", getcwd(output_path, sizeof(output_path)) ? output_path : ".");
+    }
     int index = 1;
     for (int i = 0; i < app->project.case_count; i++) {
         TestCase *tc = &app->project.cases[i];
         if (!tc->selected) continue;
+        total++;
         if (!tc->script_path[0]) {
             if (write_single_test_script(tc) != 0) {
                 printf("[NG] %s %s failed to create test script\n", tc->id, tc->title);
+                if (result) fprintf(result, "[NG] %s %s failed to create test script\n\n", tc->id, tc->title);
+                ng_count++;
                 continue;
             }
         }
         char quoted[LONG_LEN + 16];
-        char cmd[LONG_LEN + 64];
+        char output_quoted[LONG_LEN + 16];
+        char cmd[LONG_LEN * 2 + 64];
+        char result_path[LONG_LEN];
         shell_quote_buf(quoted, sizeof(quoted), tc->script_path);
-        snprintf(cmd, sizeof(cmd), "%s", quoted);
+        make_result_path(tc->script_path, result_path, sizeof(result_path));
+        unlink(result_path);
+        const char *tmpdir = getenv("TMPDIR");
+        if (!tmpdir || !tmpdir[0]) tmpdir = "/tmp";
+        snprintf(output_path, sizeof(output_path), "%s/autotest-selected-output.%d.%d", tmpdir, (int)getpid(), index);
+        shell_quote_buf(output_quoted, sizeof(output_quoted), output_path);
+        snprintf(cmd, sizeof(cmd), "%s >%s 2>&1", quoted, output_quoted);
         printf("[%02d] %s %s\n%s\n", index++, tc->id, tc->title, tc->script_path);
         int rc = system(cmd);
-        printf("exit=%d\n\n", rc);
+        int exit_code = system_exit_code(rc);
+        append_file_to_stream(stdout, output_path);
+        printf("exit=%d\n\n", exit_code);
+        if (result) {
+            fprintf(result, "[%02d] %s %s\n", index - 1, tc->id, tc->title);
+            fprintf(result, "script=%s\n", tc->script_path);
+            fprintf(result, "exit=%d\n", exit_code);
+            append_file_to_stream(result, output_path);
+            fprintf(result, "\n");
+        }
+        if (exit_code == 0) ok_count++; else ng_count++;
+        unlink(output_path);
+        if (result_path[0] && access(result_path, F_OK) == 0) {
+            if (result) {
+                fprintf(result, "individual_result=%s\n", result_path);
+                append_file_to_stream(result, result_path);
+                fprintf(result, "\n");
+            }
+            unlink(result_path);
+        }
         if (tc->kind == CMD_REBOOT) {
             printf("Reboot test was executed. If the machine rebooted, run remaining tests after boot.\n");
             break;
         }
+    }
+    if (result) {
+        fprintf(result, "Summary: total=%d OK=%d NG=%d\n", total, ok_count, ng_count);
+        fclose(result);
+        printf("Selected result: %s\n", selected_result);
+    } else {
+        printf("[NG] failed to write selected result file\n");
     }
     printf("Automated test sequence finished. Press Enter to return to TUI.");
     fflush(stdout);
@@ -3065,7 +3437,7 @@ static void run_selected_menu(App *app) {
         else if (app->selected_menu == 2) { app->selected_only = true; preview_script(app); app->screen = SCREEN_PREVIEW; app->selected_menu = 0; }
         else if (app->selected_menu == 3) {
             if (selected_count(&app->project) == 0) set_status(app, "Select at least one test before starting.");
-            else { app->selected_only = true; app->run_after_generate = true; app->previous_screen = app->screen; app->screen = SCREEN_CONFIRM; app->selected_menu = 0; }
+            else { app->selected_only = true; app->run_after_generate = true; app->confirm_action = CONFIRM_GENERATE; app->previous_screen = app->screen; app->screen = SCREEN_CONFIRM; app->selected_menu = 0; }
         }
         else set_status(app, "Use menu items with Enter. Esc exits.");
         break;
@@ -3074,14 +3446,13 @@ static void run_selected_menu(App *app) {
         else if (app->selected_menu == 1 && app->project.case_count) rename_case(app);
         else if (app->selected_menu == 2 && app->project.case_count) copy_case(app);
         else if (app->selected_menu == 3 && app->project.case_count) { app->project.cases[app->selected_case].selected = !app->project.cases[app->selected_case].selected; save_test_registry(&app->project); }
-        else if (app->selected_menu == 4) delete_case(app);
-        else if (app->selected_menu == 5) { app->screen = SCREEN_MATCH; app->selected_menu = 0; }
-        else if (app->selected_menu == 6) { app->selected_only = true; preview_script(app); app->screen = SCREEN_PREVIEW; app->selected_menu = 0; }
-        else if (app->selected_menu == 7) {
+        else if (app->selected_menu == 4 && app->project.case_count) { app->confirm_action = CONFIRM_DELETE; app->previous_screen = app->screen; app->screen = SCREEN_CONFIRM; app->selected_menu = 0; }
+        else if (app->selected_menu == 5) { app->selected_only = true; preview_script(app); app->screen = SCREEN_PREVIEW; app->selected_menu = 0; }
+        else if (app->selected_menu == 6) {
             if (selected_count(&app->project) == 0) set_status(app, "Select at least one test before starting.");
-            else { app->selected_only = true; app->run_after_generate = true; app->previous_screen = app->screen; app->screen = SCREEN_CONFIRM; app->selected_menu = 0; }
+            else { app->selected_only = true; app->run_after_generate = true; app->confirm_action = CONFIRM_GENERATE; app->previous_screen = app->screen; app->screen = SCREEN_CONFIRM; app->selected_menu = 0; }
         }
-        else if (app->selected_menu == 8) { app->screen = SCREEN_DASHBOARD; app->selected_menu = 0; }
+        else if (app->selected_menu == 7) { app->screen = SCREEN_DASHBOARD; app->selected_menu = 0; }
         break;
     case SCREEN_FORM:
         if (app->selected_menu == 0 || app->selected_menu == 1) edit_selected_field(app);
@@ -3104,11 +3475,8 @@ static void run_selected_menu(App *app) {
         else if (app->selected_menu == 6) { app->screen = SCREEN_EDITOR; app->selected_menu = 0; }
         break;
     case SCREEN_MATCH:
-        if (app->project.case_count == 0) { app->screen = SCREEN_EDITOR; break; }
-        if (app->selected_menu == 0) { CheckRule *check = primary_check(&app->project.cases[app->selected_case]); prompt_text("check_var", check->var, sizeof(check->var)); sync_primary_check_directive(&app->project.cases[app->selected_case]); write_single_test_script(&app->project.cases[app->selected_case]); save_test_registry(&app->project); }
-        else if (app->selected_menu == 1) { cycle_match(&primary_check(&app->project.cases[app->selected_case])->match); sync_primary_check_directive(&app->project.cases[app->selected_case]); write_single_test_script(&app->project.cases[app->selected_case]); save_test_registry(&app->project); }
-        else if (app->selected_menu == 2) { open_text_editor(app, EDIT_TARGET_CHECK_EXPECTED, SCREEN_MATCH); }
-        else if (app->selected_menu == 3) { app->screen = SCREEN_EDITOR; app->selected_menu = 0; }
+        app->screen = SCREEN_EDITOR;
+        app->selected_menu = 0;
         break;
     case SCREEN_CLEANUP:
         if (app->selected_menu == 0) {
@@ -3135,7 +3503,7 @@ static void run_selected_menu(App *app) {
         if (app->selected_menu == 0) { app->selected_only = true; preview_script(app); app->screen = SCREEN_PREVIEW; app->selected_menu = 0; }
         else if (app->selected_menu == 1) {
             if (selected_count(&app->project) == 0) set_status(app, "Select at least one test before starting.");
-            else { app->run_after_generate = true; app->previous_screen = app->screen; app->screen = SCREEN_CONFIRM; app->selected_menu = 0; }
+            else { app->run_after_generate = true; app->confirm_action = CONFIRM_GENERATE; app->previous_screen = app->screen; app->screen = SCREEN_CONFIRM; app->selected_menu = 0; }
         }
         else if (app->selected_menu == 2) { app->screen = SCREEN_EDITOR; app->selected_menu = 0; }
         break;
@@ -3145,7 +3513,7 @@ static void run_selected_menu(App *app) {
         if (app->selected_menu <= 3) {
             app->selected_preview_file = app->selected_menu;
             set_status(app, "Preview tabs are placeholders in MVP; main script preview is shown.");
-        } else if (app->selected_menu == 4) { app->run_after_generate = false; app->previous_screen = app->screen; app->screen = SCREEN_CONFIRM; app->selected_menu = 0; }
+        } else if (app->selected_menu == 4) { app->run_after_generate = false; app->confirm_action = CONFIRM_GENERATE; app->previous_screen = app->screen; app->screen = SCREEN_CONFIRM; app->selected_menu = 0; }
         else if (app->selected_menu == 5) { app->screen = SCREEN_EDITOR; app->selected_menu = 0; }
         break;
     case SCREEN_RESULT:
@@ -3155,7 +3523,11 @@ static void run_selected_menu(App *app) {
         break;
     case SCREEN_CONFIRM:
         if (app->selected_menu == 0) {
-            if (app->run_after_generate) {
+            if (app->confirm_action == CONFIRM_DELETE) {
+                delete_case(app);
+                app->screen = app->previous_screen;
+                app->selected_menu = 0;
+            } else if (app->run_after_generate) {
                 start_selected_test_scripts(app);
                 app->run_after_generate = false;
                 app->screen = SCREEN_RESULT;
@@ -3180,9 +3552,9 @@ static void run_selected_menu(App *app) {
 static int menu_count_for(Screen s) {
     switch (s) {
     case SCREEN_DASHBOARD: return 5;
-    case SCREEN_EDITOR: return 9;
+    case SCREEN_EDITOR: return 8;
     case SCREEN_FORM: return 7;
-    case SCREEN_MATCH: return 4;
+    case SCREEN_MATCH: return 1;
     case SCREEN_CLEANUP: return 6;
     case SCREEN_REBOOT: return 3;
     case SCREEN_SCRIPT_EDITOR: return 1;
