@@ -300,6 +300,8 @@ test_tui_source() {
   grep -Fq 'strcmp(trimmed, "vim-write-quit")' "$SRC" &&
   grep -Fq "printf 'ggdG'" "$SRC" &&
   grep -Fq "033:wq" "$SRC" &&
+  grep -Fq "033' >>\\\"\$AUTOTEST_TUI_INPUT_FILE\\\"" "$SRC" &&
+  grep -Fq "033:wq\\\\n' >>\\\"\$AUTOTEST_TUI_INPUT_FILE\\\"" "$SRC" &&
   grep -Fq 'invalid ctrl key' "$SRC"
 }
 
@@ -312,6 +314,8 @@ test_tui_capture_source() {
   grep -Fq 'autotest_clean_tui_output' "$SRC" &&
   grep -Fq 's/\\r+\\n/\\n/g' "$SRC" &&
   grep -Fq 'autotest_strip_tui_echo' "$SRC" &&
+  grep -Fq 'my $target=$in' "$SRC" &&
+  grep -Fq 'substr($out,$i+1,1)' "$SRC" &&
   grep -Fq 'write_capture_tui_metadata' "$SRC" &&
   grep -Fq 'write_load_tui_metadata' "$SRC" &&
   grep -Fq 'AUTOTEST_TUI_TRANSCRIPT=' "$SRC" &&

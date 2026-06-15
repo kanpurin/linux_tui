@@ -694,6 +694,7 @@ static void write_tui_instruction(FILE *f, const char *line, size_t len) {
         fputs("  printf '\\n' >>\"$AUTOTEST_TUI_INPUT_FILE\"\n", f);
         fputs("  printf '\\r'\n", f);
     } else if (strcmp(trimmed, "esc") == 0) {
+        fputs("  printf '\\033' >>\"$AUTOTEST_TUI_INPUT_FILE\"\n", f);
         fputs("  printf '\\033'\n", f);
     } else if (strcmp(trimmed, "tab") == 0) {
         fputs("  printf '\\t' >>\"$AUTOTEST_TUI_INPUT_FILE\"\n", f);
@@ -705,7 +706,7 @@ static void write_tui_instruction(FILE *f, const char *line, size_t len) {
         fputs("  printf 'ggdG' >>\"$AUTOTEST_TUI_INPUT_FILE\"\n", f);
         fputs("  printf 'ggdG'\n", f);
     } else if (strcmp(trimmed, "vim-write-quit") == 0) {
-        fputs("  printf ':wq\\n' >>\"$AUTOTEST_TUI_INPUT_FILE\"\n", f);
+        fputs("  printf '\\033:wq\\n' >>\"$AUTOTEST_TUI_INPUT_FILE\"\n", f);
         fputs("  printf '\\033:wq\\r'\n", f);
     } else if (strncmp(trimmed, "sleep ", 6) == 0) {
         fputs("  sleep ", f);
@@ -716,6 +717,7 @@ static void write_tui_instruction(FILE *f, const char *line, size_t len) {
     } else if (strncmp(trimmed, "ctrl ", 5) == 0 && trimmed[5]) {
         unsigned char c = (unsigned char)tolower((unsigned char)trimmed[5]);
         if (c >= 'a' && c <= 'z') {
+            fprintf(f, "  printf '\\%03o' >>\"$AUTOTEST_TUI_INPUT_FILE\"\n", c - 'a' + 1);
             fprintf(f, "  printf '\\%03o'\n", c - 'a' + 1);
         } else {
             fputs("  echo '[NG] invalid ctrl key in @tui block' >&2\n  exit 1\n", f);
@@ -2752,7 +2754,7 @@ static void write_match_function(FILE *f) {
     fputs("  output_text=$(cat \"$output\" 2>/dev/null || true)\n", f);
     fputs("  input_text=$(cat \"$input\" 2>/dev/null || true)\n", f);
     fputs("  if command -v perl >/dev/null 2>&1; then\n", f);
-    fputs("    perl -0777 -e 'my ($out_path,$in_path)=@ARGV; open my $ofh,\"<\",$out_path or exit 0; local $/; my $out=readline($ofh); open my $ifh,\"<\",$in_path or exit 0; my $in=readline($ifh); if (length($in) && index($out,$in)==0) { $out=substr($out,length($in)); $out =~ s/^\\n+//; open my $wfh,\">\",$out_path or exit 0; print {$wfh} $out; }' \"$output\" \"$input\"\n", f);
+    fputs("    perl -0777 -e 'my ($out_path,$in_path)=@ARGV; open my $ofh,\"<\",$out_path or exit 0; local $/; my $out=readline($ofh); open my $ifh,\"<\",$in_path or exit 0; my $in=readline($ifh); my $target=$in; $target =~ s/[\\x00-\\x1F\\x7F]//g; exit 0 unless length $target; my $seen=\"\"; my $pos=-1; for (my $i=0; $i<length($out); $i++) { my $ch=substr($out,$i,1); if ($ch =~ /[\\x00-\\x1F\\x7F]/) { next; } if ($ch eq \"^\" && $i + 1 < length($out) && substr($out,$i+1,1) =~ /[\\@-_?]/) { $i++; next; } $seen .= $ch; if (index($target,$seen) != 0) { last; } if ($seen eq $target) { $pos=$i+1; last; } } if ($pos >= 0) { $out=substr($out,$pos); $out =~ s/^\\s+//; open my $wfh,\">\",$out_path or exit 0; print {$wfh} $out; }' \"$output\" \"$input\"\n", f);
     fputs("  elif [ -n \"$input_text\" ] && [ \"$output_text\" = \"$input_text\" ]; then\n", f);
     fputs("    : >\"$output\"\n", f);
     fputs("  fi\n", f);
