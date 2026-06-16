@@ -152,7 +152,7 @@ int main(void) {
 EOF
   (
     cd "$TMP_ROOT" &&
-    gcc -Wall -Wextra -o check_position "$harness" -lncurses >/dev/null 2>&1 &&
+    gcc -Wall -Wextra -o check_position "$harness" -lncursesw >/dev/null 2>&1 &&
     ./check_position &&
     ./check_position.sh --detail check_position.detail >check_position.out 2>&1 &&
     grep -Fq '[OK] TC999 check_position' check_position.out &&
@@ -240,7 +240,7 @@ int main(void) {
 EOF
   (
     cd "$TMP_ROOT" &&
-    gcc -Wall -Wextra -o tui_argument_quoting "$harness" -lncurses >/dev/null 2>&1 &&
+    gcc -Wall -Wextra -o tui_argument_quoting "$harness" -lncursesw >/dev/null 2>&1 &&
     ./tui_argument_quoting
   )
 }
@@ -256,7 +256,7 @@ test_script_name_collision_source() {
   grep -Fq 'access(path, F_OK) == 0' "$SRC" &&
   grep -Fq 'return -2' "$SRC" &&
   grep -Fq 'Script name already exists in this directory.' "$SRC" &&
-  grep -Fq 'int ch = getch()' "$SRC" &&
+  grep -Fq 'int ch = read_tui_input()' "$SRC" &&
   grep -Fq 'if (ch == 27)' "$SRC" &&
   grep -Fq 'if (!accepted) return false' "$SRC" &&
   grep -Fq 'if (title_path_conflicts(&new_case, new_case.title))' "$SRC" &&
@@ -303,9 +303,11 @@ test_detail_result_source() {
   grep -Fq 'AUTOTEST_DETAIL_COLOR=1' "$SRC" &&
   grep -Fq '\\033[36m%s\\033[0m=%s\\n' "$SRC" &&
   grep -Fq '\\033[36m%s\\033[0m:\\n' "$SRC" &&
-  grep -Fq 'printf '\''%s\\n'\'' \"$value\" | cat -v' "$SRC" &&
+  grep -Fq 'autotest_detail_sanitize()' "$SRC" &&
+  grep -Fq 'autotest_detail_sanitize <\"$path\"' "$SRC" &&
+  grep -Fq 'printf '\''%s\\n'\'' \"$value\" | autotest_detail_sanitize' "$SRC" &&
   grep -Fq 'AUTOTEST_DETAIL_SAFE:-0}' "$SRC" &&
-  grep -Fq 'cat -v' "$SRC" &&
+  ! grep -Fq 'cat -v' "$SRC" &&
   grep -Fq 'autotest_detail_check_value \"$check_failed\" \"expected $name\" \"$expected\"' "$SRC" &&
   grep -Fq 'autotest_detail_check_value \"$check_failed\" \"actual $name\" \"$value\"' "$SRC" &&
   grep -Fq 'value_ref=\"actual_value_$i\"' "$SRC" &&
@@ -416,6 +418,9 @@ test_editor_source() {
   grep -Fq 'print_current_test_script' "$SRC" &&
   grep -Fq 'strcmp(app->editor_command, "print")' "$SRC" &&
   grep -Fq 'print_editor_script(app)' "$SRC" &&
+  grep -Fq 'first_row = app->editor_row - rows + 1' "$SRC" &&
+  grep -Fq 'line_index = first_row + i' "$SRC" &&
+  grep -Fq 'app->editor_row - first_row' "$SRC" &&
   grep -Fq 'editor_copy_lines' "$SRC" &&
   grep -Fq 'editor_paste_lines' "$SRC" &&
   grep -Fq 'editor_search_next' "$SRC" &&
@@ -429,14 +434,132 @@ test_editor_source() {
   grep -Fq 'indent_len' "$SRC" &&
   grep -Fq 'app->editor_col = copy_indent' "$SRC" &&
   grep -Fq 'set_escdelay(150)' "$SRC" &&
+  grep -Fq 'setlocale(LC_ALL, "")' "$SRC" &&
+  grep -Fq 'meta(stdscr, TRUE)' "$SRC" &&
+  grep -Fq 'get_wch' "$SRC" &&
+  grep -Fq 'editor_insert_wchar' "$SRC" &&
+  grep -Fq 'utf8_prev_index' "$SRC" &&
+  grep -Fq 'utf8_next_index' "$SRC" &&
+  grep -Fq 'editor_is_text_char' "$SRC" &&
+  grep -Fq 'ch == KEY_BACKSPACE || ch == KEY_DC' "$SRC" &&
+  grep -Fq 'app->editor_command_mode = false' "$SRC" &&
+  grep -Fq 'app->editor_search_mode = false' "$SRC" &&
+  grep -Fq 'if (cy <= height - 4' "$SRC" &&
+  grep -Fq 'app->selected_case + app->project.case_count - 1' "$SRC" &&
+  grep -Fq 'app->selected_case = (app->selected_case + 1) % app->project.case_count' "$SRC" &&
+  grep -Fq 'Edit description' "$SRC" &&
+  grep -Fq 'EDIT_TARGET_DESCRIPTION' "$SRC" &&
+  grep -Fq 'Saved description.' "$SRC" &&
+  ! grep -Fq 'Arrow move  i insert' "$SRC" &&
+  ! grep -Fq 'Regex templates: :template' "$SRC" &&
   grep -Fq 'ch == KEY_DOWN' "$SRC" &&
   grep -Fq 'ch == KEY_UP' "$SRC"
+}
+
+test_editor_utf8_behavior() {
+  harness="$TMP_ROOT/editor_utf8.c"
+  cat >"$harness" <<EOF
+#define main autotest_builder_app_main
+#include "$SRC"
+#undef main
+EOF
+  cat >>"$harness" <<'EOF'
+
+int main(void) {
+    App app;
+    char jp[] = { (char)0xe3, (char)0x81, (char)0x82, 'A', '\0' };
+    setlocale(LC_ALL, "");
+    init_app(&app);
+    editor_insert_wchar(&app, 0x3042);
+    if (memcmp(app.editor_lines[0], jp, 3) != 0) return 6;
+    app.editor_lines[0][0] = '\0';
+    app.editor_col = 0;
+    load_editor_text(&app, jp);
+    if (!editor_is_text_char(0xe3)) return 1;
+    if (utf8_next_index(app.editor_lines[0], 0) != 3) return 2;
+    if (utf8_prev_index(app.editor_lines[0], 3) != 0) return 3;
+    if (editor_visual_col(app.editor_lines[0], 3) != 2) return 4;
+    app.editor_col = 3;
+    editor_backspace(&app);
+    if (strcmp(app.editor_lines[0], "A") != 0) return 5;
+    return 0;
+}
+EOF
+  (
+    cd "$TMP_ROOT" &&
+    gcc -Wall -Wextra -o editor_utf8 "$harness" -lncursesw >/dev/null 2>&1 &&
+    ./editor_utf8
+  )
+}
+
+test_syntax_validation_source() {
+  grep -Fq 'validate_script_syntax' "$SRC" &&
+  grep -Fq 'validate_custom_syntax' "$SRC" &&
+  grep -Fq 'validate_generated_bash' "$SRC" &&
+  grep -Fq 'bash -n' "$SRC" &&
+  grep -Fq 'Syntax error line %d' "$SRC" &&
+  grep -Fq 'missing @end for @tui block' "$SRC" &&
+  grep -Fq 'unknown command in @tui block' "$SRC"
+}
+
+test_syntax_validation_behavior() {
+  harness="$TMP_ROOT/syntax_validation.c"
+  cat >"$harness" <<EOF
+#define main autotest_builder_app_main
+#include "$SRC"
+#undef main
+EOF
+  cat >>"$harness" <<'EOF'
+
+static int expect_valid(const char *script) {
+    SyntaxError err;
+    return validate_script_syntax(script, &err) ? 0 : 1;
+}
+
+static int expect_invalid_line(const char *script, int line_no) {
+    SyntaxError err;
+    if (validate_script_syntax(script, &err)) return 1;
+    return err.line_no == line_no ? 0 : 1;
+}
+
+int main(void) {
+    if (expect_valid("TEST=A\n@check TEST exact A\n")) return 1;
+    if (expect_valid("@tui vim /tmp/a\n  send gg\n  vim-write-quit\n@end\n")) return 2;
+    if (expect_invalid_line("@tui vim\n  send gg\n", 2)) return 3;
+    if (expect_invalid_line("@tui vim\n  bogus\n@end\n", 2)) return 4;
+    if (expect_invalid_line("@check TEST exact <<EOF\nhello\n", 1)) return 5;
+    if (expect_invalid_line("@tui vim\n  send \"unterminated\n@end\n", 2)) return 6;
+    if (!validate_script_syntax("if true; then\n  echo ok\n", &(SyntaxError){0})) return 0;
+    return 7;
+}
+EOF
+  (
+    cd "$TMP_ROOT" &&
+    gcc -Wall -Wextra -o syntax_validation "$harness" -lncursesw >/dev/null 2>&1 &&
+    ./syntax_validation
+  )
 }
 
 test_registry_source() {
   grep -Fq '.config/autotest-assist/tests.tsv' "$SRC" &&
   grep -Fq 'script_path' "$SRC" &&
+  grep -Fq 'description' "$SRC" &&
+  grep -Fq 'autotest-assist tests v3' "$SRC" &&
+  grep -Fq 'escape_field(fields[6 + LEGACY_REGISTRY_CHECKS * 3 + 1]' "$SRC" &&
+  grep -Fq 'unescape_field(tc->description' "$SRC" &&
   grep -Fq 'save_test_registry' "$SRC"
+}
+
+test_description_source() {
+  grep -Fq 'char description[LONG_LEN]' "$SRC" &&
+  grep -Fq 'description:' "$SRC" &&
+  grep -Fq 'draw_wrapped_text' "$SRC" &&
+  grep -Fq 'desc_rows' "$SRC" &&
+  grep -Fq 'draw_wrapped_text(line' "$SRC" &&
+  ! grep -Fq 'desc_y = y + h - desc_rows - 1' "$SRC" &&
+  grep -Fq 'write_comment_block(f, "Title", tc->title)' "$SRC" &&
+  grep -Fq 'write_comment_block(f, "Description", tc->description)' "$SRC" &&
+  grep -Fq 'preview_add_comment_block(app, "  ", "Description", tc->description)' "$SRC"
 }
 
 test_delete_source() {
@@ -496,7 +619,11 @@ run_case '@reboot-if source support' test_reboot_if_source
 run_case '@tui source support' test_tui_source
 run_case '@tui output capture source support' test_tui_capture_source
 run_case 'editor command source support' test_editor_source
+run_case 'editor UTF-8 behavior' test_editor_utf8_behavior
+run_case 'save-time syntax validation source support' test_syntax_validation_source
+run_case 'save-time syntax validation behavior' test_syntax_validation_behavior
 run_case 'registry source support' test_registry_source
+run_case 'test description source support' test_description_source
 run_case 'delete test source support' test_delete_source
 run_case 'result display source support' test_result_display_source
 run_case 'README limitations documentation' test_docs_limitations

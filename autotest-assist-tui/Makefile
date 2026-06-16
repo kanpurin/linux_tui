@@ -1,7 +1,7 @@
 CC ?= gcc
 CFLAGS ?= -std=c11 -Wall -Wextra -pedantic -O2
 LDFLAGS ?=
-LDLIBS ?= -lncurses
+LDLIBS ?= -lncursesw
 
 TARGET := autotest-builder
 SRC := autotest_builder.c
