@@ -128,6 +128,40 @@ test_multiple_checks_one_fails() {
   [ "$ok" -eq 0 ]
 }
 
+test_check_position_capture() {
+  harness="$TMP_ROOT/check_position.c"
+  cat >"$harness" <<EOF
+#define main autotest_builder_app_main
+#include "$SRC"
+#undef main
+
+int main(void) {
+    TestCase tc;
+    memset(&tc, 0, sizeof(tc));
+    copy_text(tc.id, sizeof(tc.id), "TC999");
+    copy_text(tc.title, sizeof(tc.title), "check_position");
+    tc.kind = CMD_SHELL;
+    tc.expected_exit = 0;
+    copy_text(tc.command, sizeof(tc.command),
+        "TEST=A\\n"
+        "@check TEST exact A\\n"
+        "TEST=B\\n"
+        "@check TEST exact B\\n");
+    return write_single_test_script(&tc);
+}
+EOF
+  (
+    cd "$TMP_ROOT" &&
+    gcc -Wall -Wextra -o check_position "$harness" -lncurses >/dev/null 2>&1 &&
+    ./check_position &&
+    ./check_position.sh --detail check_position.detail >check_position.out 2>&1 &&
+    grep -Fq '[OK] TC999 check_position' check_position.out &&
+    grep -Fq 'actual_1=A' check_position.detail &&
+    grep -Fq 'actual_2=B' check_position.detail &&
+    ! grep -Fq '[NG] TC999 check_position' check_position.out
+  )
+}
+
 test_assert_true() {
   value="ready"
   if ! [ "$value" = ready ]; then
@@ -187,6 +221,9 @@ test_script_name_collision_source() {
   grep -Fq 'access(path, F_OK) == 0' "$SRC" &&
   grep -Fq 'return -2' "$SRC" &&
   grep -Fq 'Script name already exists in this directory.' "$SRC" &&
+  grep -Fq 'int ch = getch()' "$SRC" &&
+  grep -Fq 'if (ch == 27)' "$SRC" &&
+  grep -Fq 'if (!accepted) return false' "$SRC" &&
   grep -Fq 'if (title_path_conflicts(&new_case, new_case.title))' "$SRC" &&
   grep -Fq 'if (title_path_conflicts(tc, tc->title))' "$SRC"
 }
@@ -331,6 +368,13 @@ test_tui_capture_source() {
 
 test_editor_source() {
   grep -Fq 'editor_undo' "$SRC" &&
+  grep -Fq 'EDITOR_UNDO_DEPTH' "$SRC" &&
+  grep -Fq 'editor_undo_count' "$SRC" &&
+  grep -Fq -- '--app->editor_undo_count' "$SRC" &&
+  grep -Fq 'Print script' "$SRC" &&
+  grep -Fq 'print_current_test_script' "$SRC" &&
+  grep -Fq 'strcmp(app->editor_command, "print")' "$SRC" &&
+  grep -Fq 'print_editor_script(app)' "$SRC" &&
   grep -Fq 'editor_copy_lines' "$SRC" &&
   grep -Fq 'editor_paste_lines' "$SRC" &&
   grep -Fq 'editor_search_next' "$SRC" &&
@@ -397,6 +441,7 @@ run_case 'detail result option source support' test_detail_result_source
 run_case 'variable match types' test_match_value
 run_case 'multiple variable checks pass' test_multiple_checks_all_pass
 run_case 'multiple variable checks fail as AND' test_multiple_checks_one_fails
+run_case '@check captures value at directive position' test_check_position_capture
 run_case '@assert true condition' test_assert_true
 run_case '@assert false condition fails' test_assert_false
 run_case '@backup/@restore existing file' test_backup_restore_existing_file

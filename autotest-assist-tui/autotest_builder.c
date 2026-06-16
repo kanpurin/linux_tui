@@ -18,6 +18,7 @@
 #define EDITOR_COLS 256
 #define REGISTRY_LINE (LONG_LEN * 4)
 #define EDITOR_TAB_WIDTH 4
+#define EDITOR_UNDO_DEPTH 32
 #define LEGACY_REGISTRY_CHECKS 4
 
 typedef enum {
@@ -118,11 +119,11 @@ typedef struct {
     int editor_search_len;
     char editor_clipboard[EDITOR_LINES][EDITOR_COLS];
     int editor_clipboard_count;
-    char editor_undo_lines[EDITOR_LINES][EDITOR_COLS];
-    int editor_undo_line_count;
-    int editor_undo_row;
-    int editor_undo_col;
-    bool editor_has_undo;
+    char editor_undo_lines[EDITOR_UNDO_DEPTH][EDITOR_LINES][EDITOR_COLS];
+    int editor_undo_line_count[EDITOR_UNDO_DEPTH];
+    int editor_undo_row[EDITOR_UNDO_DEPTH];
+    int editor_undo_col[EDITOR_UNDO_DEPTH];
+    int editor_undo_count;
     char status[TEXT_LEN];
     char preview[PREVIEW_LINES][LONG_LEN];
     int preview_count;
@@ -154,6 +155,7 @@ static const RegexTemplate REGEX_TEMPLATES[] = {
 
 static const char *EDITOR_HELP_LINES[] = {
     "Close: Esc / Enter / q    Scroll: Up/Down PgUp/PgDn",
+    ":print                         Print current editor text to stdout.",
     "",
     "Script directives",
     "@check <var> <match> <expected>  Add a variable assertion.",
@@ -479,7 +481,7 @@ static void load_editor_text(App *app, const char *src) {
     app->editor_search_len = 0;
     app->editor_search[0] = '\0';
     app->editor_clipboard_count = 0;
-    app->editor_has_undo = false;
+    app->editor_undo_count = 0;
     memset(app->editor_lines, 0, sizeof(app->editor_lines));
 
     int row = 0;
@@ -517,6 +519,35 @@ static void save_editor_text(App *app, char *dst, size_t dst_sz) {
         if (r + 1 < app->editor_line_count) dst[pos++] = '\n';
     }
     dst[pos] = '\0';
+}
+
+static void print_raw_script_text(const char *text) {
+    def_prog_mode();
+    endwin();
+    fputs(text ? text : "", stdout);
+    if (!text || text[0] == '\0' || text[strlen(text) - 1] != '\n') fputc('\n', stdout);
+    fflush(stdout);
+    fprintf(stderr, "\nPress Enter to return to TUI.");
+    fflush(stderr);
+    (void)getchar();
+    reset_prog_mode();
+    refresh();
+}
+
+static void print_current_test_script(App *app) {
+    if (app->project.case_count <= 0) {
+        set_status(app, "No test script to print.");
+        return;
+    }
+    print_raw_script_text(app->project.cases[app->selected_case].command);
+    set_status(app, "Printed script to stdout.");
+}
+
+static void print_editor_script(App *app) {
+    char buf[LONG_LEN];
+    save_editor_text(app, buf, sizeof(buf));
+    print_raw_script_text(buf);
+    set_status(app, "Printed editor script to stdout.");
 }
 
 static void load_editor_from_case(App *app) {
@@ -737,6 +768,12 @@ static void write_shell_line(FILE *f, const char *line, size_t len) {
     fputc('\n', f);
 }
 
+static void write_inline_check_capture(FILE *f, const CheckRule *check) {
+    const char *var = check->var[0] ? check->var : "AUTOTEST_ACTUAL";
+    fputs("AUTOTEST_CHECK_INDEX=$(( ${AUTOTEST_CHECK_INDEX:-0} + 1 ))\n", f);
+    fprintf(f, "printf '%%s' \"${%s-}\" >\"$actual_dir/actual_${AUTOTEST_CHECK_INDEX}\"\n", var);
+}
+
 static void write_command_expanded(FILE *f, const char *command) {
     bool in_tui = false;
     char tui_cmd[LONG_LEN];
@@ -788,8 +825,9 @@ static void write_command_expanded(FILE *f, const char *command) {
             } else if (line_starts_directive(p, len, "@check", directive_arg, sizeof(directive_arg))) {
                 CheckRule parsed;
                 char heredoc_delim[TEXT_LEN];
-                if (parse_check_arg(directive_arg, &parsed, heredoc_delim, sizeof(heredoc_delim)) && heredoc_delim[0]) {
-                    copy_text(skip_check_delim, sizeof(skip_check_delim), heredoc_delim);
+                if (parse_check_arg(directive_arg, &parsed, heredoc_delim, sizeof(heredoc_delim))) {
+                    write_inline_check_capture(f, &parsed);
+                    if (heredoc_delim[0]) copy_text(skip_check_delim, sizeof(skip_check_delim), heredoc_delim);
                 }
                 fputs(": # @check handled by autotest builder\n", f);
             } else if (line_is_tui_end(p, len)) {
@@ -1564,8 +1602,8 @@ static void draw_editor(const App *app, int height, int width) {
     if (has_reboot(&app->project)) {
         mvprintw(bottom + 2, 1, "selected reboot tests may interrupt sequential execution");
     }
-    static const char *menu[] = {"Edit test", "Rename test", "Copy test", "Select test", "Delete test", "Preview selected", "Start selected tests", "Back"};
-    draw_menu(height - 4, 1, width - 2, menu, 8, app->selected_menu);
+    static const char *menu[] = {"Edit test", "Rename test", "Copy test", "Select test", "Delete test", "Print script", "Preview selected", "Start selected tests", "Back"};
+    draw_menu(height - 4, 1, width - 2, menu, 9, app->selected_menu);
 }
 
 static void draw_form(const App *app, int height, int width) {
@@ -1906,7 +1944,8 @@ static void draw_app(App *app) {
 }
 
 static bool prompt_text(const char *label, char *buf, size_t buf_sz) {
-    echo();
+    if (buf_sz == 0) return false;
+    noecho();
     curs_set(1);
     int h, w;
     getmaxyx(stdscr, h, w);
@@ -1918,16 +1957,54 @@ static bool prompt_text(const char *label, char *buf, size_t buf_sz) {
         mvhline(y + row, x, ' ', box_w);
     }
     draw_box(y, x, box_h, box_w, label);
-    mvhline(h / 2, 5, ' ', w - 10);
-    mvprintw(h / 2, 6, "> ");
-    clrtoeol();
     char tmp[LONG_LEN];
     snprintf(tmp, sizeof(tmp), "%s", buf);
-    move(h / 2, 8);
-    int rc = getnstr(tmp, (int)sizeof(tmp) - 1);
-    noecho();
+    size_t max_len = buf_sz - 1;
+    if (max_len >= sizeof(tmp)) max_len = sizeof(tmp) - 1;
+    tmp[max_len] = '\0';
+    int len = (int)strlen(tmp);
+    int col = len;
+    bool accepted = false;
+    for (;;) {
+        int input_w = w - 12;
+        if (input_w < 1) input_w = 1;
+        int start = 0;
+        if (col >= input_w) start = col - input_w + 1;
+        mvhline(h / 2, 5, ' ', w - 10);
+        mvprintw(h / 2, 6, "> ");
+        mvprintw(h / 2, 8, "%.*s", input_w, tmp + start);
+        move(h / 2, 8 + col - start);
+        int ch = getch();
+        if (ch == 27) {
+            accepted = false;
+            break;
+        }
+        if (ch == '\n' || ch == KEY_ENTER) {
+            accepted = true;
+            break;
+        }
+        if (ch == KEY_BACKSPACE || ch == 127 || ch == 8) {
+            if (col > 0) {
+                memmove(tmp + col - 1, tmp + col, (size_t)(len - col + 1));
+                col--;
+                len--;
+            }
+        } else if (ch == KEY_LEFT) {
+            if (col > 0) col--;
+        } else if (ch == KEY_RIGHT) {
+            if (col < len) col++;
+        } else if (ch == KEY_HOME) {
+            col = 0;
+        } else if (ch == KEY_END) {
+            col = len;
+        } else if (isprint(ch) && len < (int)max_len) {
+            memmove(tmp + col + 1, tmp + col, (size_t)(len - col + 1));
+            tmp[col++] = (char)ch;
+            len++;
+        }
+    }
     curs_set(0);
-    if (rc == ERR) return false;
+    if (!accepted) return false;
     snprintf(buf, buf_sz, "%s", tmp);
     return true;
 }
@@ -1995,23 +2072,30 @@ static void set_vim_command(TestCase *tc) {
 }
 
 static void editor_save_undo(App *app) {
-    memcpy(app->editor_undo_lines, app->editor_lines, sizeof(app->editor_lines));
-    app->editor_undo_line_count = app->editor_line_count;
-    app->editor_undo_row = app->editor_row;
-    app->editor_undo_col = app->editor_col;
-    app->editor_has_undo = true;
+    if (app->editor_undo_count >= EDITOR_UNDO_DEPTH) {
+        memmove(app->editor_undo_lines, app->editor_undo_lines + 1, sizeof(app->editor_undo_lines[0]) * (EDITOR_UNDO_DEPTH - 1));
+        memmove(app->editor_undo_line_count, app->editor_undo_line_count + 1, sizeof(app->editor_undo_line_count[0]) * (EDITOR_UNDO_DEPTH - 1));
+        memmove(app->editor_undo_row, app->editor_undo_row + 1, sizeof(app->editor_undo_row[0]) * (EDITOR_UNDO_DEPTH - 1));
+        memmove(app->editor_undo_col, app->editor_undo_col + 1, sizeof(app->editor_undo_col[0]) * (EDITOR_UNDO_DEPTH - 1));
+        app->editor_undo_count = EDITOR_UNDO_DEPTH - 1;
+    }
+    int slot = app->editor_undo_count++;
+    memcpy(app->editor_undo_lines[slot], app->editor_lines, sizeof(app->editor_lines));
+    app->editor_undo_line_count[slot] = app->editor_line_count;
+    app->editor_undo_row[slot] = app->editor_row;
+    app->editor_undo_col[slot] = app->editor_col;
 }
 
 static void editor_undo(App *app) {
-    if (!app->editor_has_undo) {
+    if (app->editor_undo_count <= 0) {
         set_status(app, "No undo available.");
         return;
     }
-    memcpy(app->editor_lines, app->editor_undo_lines, sizeof(app->editor_lines));
-    app->editor_line_count = app->editor_undo_line_count;
-    app->editor_row = app->editor_undo_row;
-    app->editor_col = app->editor_undo_col;
-    app->editor_has_undo = false;
+    int slot = --app->editor_undo_count;
+    memcpy(app->editor_lines, app->editor_undo_lines[slot], sizeof(app->editor_lines));
+    app->editor_line_count = app->editor_undo_line_count[slot];
+    app->editor_row = app->editor_undo_row[slot];
+    app->editor_col = app->editor_undo_col[slot];
     set_status(app, "Undo.");
 }
 
@@ -2383,6 +2467,8 @@ static void handle_script_editor_key(App *app, int ch) {
                 if (app->editor_target == EDIT_TARGET_COMMAND) discard_current_case_if_new(app);
                 app->screen = app->previous_screen;
                 set_status(app, "Canceled script editor.");
+            } else if (strcmp(app->editor_command, "print") == 0) {
+                print_editor_script(app);
             } else if (strcmp(app->editor_command, "template") == 0 && editor_uses_regex_templates(app)) {
                 app->regex_template_list_open = true;
                 app->selected_menu = 0;
@@ -2870,6 +2956,7 @@ static void write_rescue_continue(FILE *f, const char *indent) {
 }
 
 static void write_capture_checks(FILE *f, const TestCase *tc, const char *indent, const char *dir_expr) {
+    if (command_check_count(tc->command) > 0) return;
     int count = 0;
     const char *cursor = tc->command;
     bool used_legacy = false;
@@ -3449,12 +3536,13 @@ static void run_selected_menu(App *app) {
         else if (app->selected_menu == 2 && app->project.case_count) copy_case(app);
         else if (app->selected_menu == 3 && app->project.case_count) { app->project.cases[app->selected_case].selected = !app->project.cases[app->selected_case].selected; save_test_registry(&app->project); }
         else if (app->selected_menu == 4 && app->project.case_count) { app->confirm_action = CONFIRM_DELETE; app->previous_screen = app->screen; app->screen = SCREEN_CONFIRM; app->selected_menu = 0; }
-        else if (app->selected_menu == 5) { app->selected_only = true; preview_script(app); app->screen = SCREEN_PREVIEW; app->selected_menu = 0; }
-        else if (app->selected_menu == 6) {
+        else if (app->selected_menu == 5 && app->project.case_count) print_current_test_script(app);
+        else if (app->selected_menu == 6) { app->selected_only = true; preview_script(app); app->screen = SCREEN_PREVIEW; app->selected_menu = 0; }
+        else if (app->selected_menu == 7) {
             if (selected_count(&app->project) == 0) set_status(app, "Select at least one test before starting.");
             else { app->selected_only = true; app->run_after_generate = true; app->confirm_action = CONFIRM_GENERATE; app->previous_screen = app->screen; app->screen = SCREEN_CONFIRM; app->selected_menu = 0; }
         }
-        else if (app->selected_menu == 7) { app->screen = SCREEN_DASHBOARD; app->selected_menu = 0; }
+        else if (app->selected_menu == 8) { app->screen = SCREEN_DASHBOARD; app->selected_menu = 0; }
         break;
     case SCREEN_FORM:
         if (app->selected_menu == 0 || app->selected_menu == 1) edit_selected_field(app);
@@ -3554,7 +3642,7 @@ static void run_selected_menu(App *app) {
 static int menu_count_for(Screen s) {
     switch (s) {
     case SCREEN_DASHBOARD: return 5;
-    case SCREEN_EDITOR: return 8;
+    case SCREEN_EDITOR: return 9;
     case SCREEN_FORM: return 7;
     case SCREEN_MATCH: return 1;
     case SCREEN_CLEANUP: return 6;
