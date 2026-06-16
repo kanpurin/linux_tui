@@ -210,6 +210,41 @@ test_reboot_if_false_branch() {
   [ "$rc" -eq 125 ]
 }
 
+test_tui_argument_quoting() {
+  harness="$TMP_ROOT/tui_argument_quoting.c"
+  cat >"$harness" <<EOF
+#define main autotest_builder_app_main
+#include "$SRC"
+#undef main
+
+static int expect_decoded(const char *src, const char *expected) {
+    char out[LONG_LEN];
+    decode_tui_argument(src, out, sizeof(out));
+    return strcmp(out, expected) == 0;
+}
+
+int main(void) {
+    const char quoted[] = {34, 'a', 'b', 'c', 34, 0};
+    const char mixed[] = {'a', 34, 'b', ' ', 'c', 34, 'd', 0};
+    const char escaped_quote[] = {92, 34, 'q', 'u', 'o', 't', 'e', 92, 34, 0};
+    const char quote_expected[] = {34, 'q', 'u', 'o', 't', 'e', 34, 0};
+    const char single_quoted[] = {39, 's', 'i', 'n', 'g', 'l', 'e', ' ', 'q', 'u', 'o', 't', 'e', 'd', 39, 0};
+    const char slash_pair[] = {92, 92, 0};
+    const char slash_expected[] = {92, 0};
+    return expect_decoded(quoted, "abc") &&
+           expect_decoded(mixed, "ab cd") &&
+           expect_decoded(escaped_quote, quote_expected) &&
+           expect_decoded(single_quoted, "single quoted") &&
+           expect_decoded(slash_pair, slash_expected) ? 0 : 1;
+}
+EOF
+  (
+    cd "$TMP_ROOT" &&
+    gcc -Wall -Wextra -o tui_argument_quoting "$harness" -lncurses >/dev/null 2>&1 &&
+    ./tui_argument_quoting
+  )
+}
+
 test_title_filename_source() {
   grep -Fq 'const char *src = tc->title[0] ? tc->title : tc->id' "$SRC" &&
   grep -Fq 'snprintf(out, out_sz, "%s.sh", safe_name)' "$SRC" &&
@@ -329,6 +364,7 @@ test_reboot_if_source() {
 }
 
 test_tui_source() {
+  grep -Fq 'decode_tui_argument' "$SRC" &&
   grep -Fq 'send-shell' "$SRC" &&
   grep -Fq 'text-shell' "$SRC" &&
   grep -Fq 'strcmp(trimmed, "esc")' "$SRC" &&
@@ -447,6 +483,7 @@ run_case '@assert false condition fails' test_assert_false
 run_case '@backup/@restore existing file' test_backup_restore_existing_file
 run_case '@backup/@restore missing file' test_backup_restore_missing_file
 run_case '@reboot-if false branch does not reboot' test_reboot_if_false_branch
+run_case '@tui send/text argument quoting' test_tui_argument_quoting
 run_case '@check source support' test_check_directive_source
 run_case '@assert source support' test_assert_directive_source
 run_case '@backup/@restore source support' test_backup_restore_source

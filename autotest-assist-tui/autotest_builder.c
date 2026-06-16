@@ -174,6 +174,7 @@ static const char *EDITOR_HELP_LINES[] = {
     "@tui <command>                  Start pseudo-terminal automation.",
     "@end                            End the @tui block.",
     "send <keys>                     Send literal keys without newline.",
+    "    Quotes group text and are not sent; escape them as \\\" or \\'.",
     "send-shell <expr>               Send shell-expanded text.",
     "text <text>                     Send text plus newline.",
     "text-shell <expr>               Send shell-expanded text plus newline.",
@@ -674,6 +675,23 @@ static void shell_quote_len(FILE *f, const char *s, size_t len) {
     fputc('\'', f);
 }
 
+static void decode_tui_argument(const char *src, char *dst, size_t dst_sz) {
+    size_t j = 0;
+    char quote = '\0';
+    if (dst_sz == 0) return;
+    for (size_t i = 0; src && src[i] && j + 1 < dst_sz; i++) {
+        char c = src[i];
+        if (c == '\\' && src[i + 1]) {
+            dst[j++] = src[++i];
+        } else if ((c == '"' || c == '\'') && (quote == '\0' || quote == c)) {
+            quote = quote == c ? '\0' : c;
+        } else {
+            dst[j++] = c;
+        }
+    }
+    dst[j] = '\0';
+}
+
 static bool line_starts_tui(const char *line, size_t len, char *cmd, size_t cmd_sz) {
     char trimmed[LONG_LEN];
     trim_line_copy(trimmed, sizeof(trimmed), line, len);
@@ -692,13 +710,15 @@ static bool line_is_tui_end(const char *line, size_t len) {
 
 static void write_tui_instruction(FILE *f, const char *line, size_t len) {
     char trimmed[LONG_LEN];
+    char decoded[LONG_LEN];
     trim_line_copy(trimmed, sizeof(trimmed), line, len);
     if (strncmp(trimmed, "send ", 5) == 0) {
+        decode_tui_argument(trimmed + 5, decoded, sizeof(decoded));
         fputs("  printf ", f);
-        shell_quote_len(f, trimmed + 5, strlen(trimmed + 5));
+        shell_quote_len(f, decoded, strlen(decoded));
         fputs(" >>\"$AUTOTEST_TUI_INPUT_FILE\"\n", f);
         fputs("  printf ", f);
-        shell_quote_len(f, trimmed + 5, strlen(trimmed + 5));
+        shell_quote_len(f, decoded, strlen(decoded));
         fputc('\n', f);
     } else if (strncmp(trimmed, "send-shell ", 11) == 0) {
         fputs("  printf '%s' ", f);
@@ -708,11 +728,12 @@ static void write_tui_instruction(FILE *f, const char *line, size_t len) {
         fputs(trimmed + 11, f);
         fputc('\n', f);
     } else if (strncmp(trimmed, "text ", 5) == 0) {
+        decode_tui_argument(trimmed + 5, decoded, sizeof(decoded));
         fputs("  printf ", f);
-        shell_quote_len(f, trimmed + 5, strlen(trimmed + 5));
+        shell_quote_len(f, decoded, strlen(decoded));
         fputs(" >>\"$AUTOTEST_TUI_INPUT_FILE\"\n  printf '\\n' >>\"$AUTOTEST_TUI_INPUT_FILE\"\n", f);
         fputs("  printf ", f);
-        shell_quote_len(f, trimmed + 5, strlen(trimmed + 5));
+        shell_quote_len(f, decoded, strlen(decoded));
         fputs("\n  printf '\\n'\n", f);
     } else if (strncmp(trimmed, "text-shell ", 11) == 0) {
         fputs("  printf '%s\\n' ", f);
