@@ -291,6 +291,11 @@ test_detail_result_source() {
   grep -Fq 'autotest_detail_cat' "$SRC" &&
   grep -Fq 'autotest_detail_kv' "$SRC" &&
   grep -Fq 'autotest_detail_value' "$SRC" &&
+  grep -Fq 'autotest_detail_check_kv' "$SRC" &&
+  grep -Fq 'autotest_detail_check_value' "$SRC" &&
+  grep -Fq 'check_failed=0' "$SRC" &&
+  grep -Fq 'check_failed=1' "$SRC" &&
+  grep -Fq '\\033[31m%s\\033[0m' "$SRC" &&
   grep -Fq 'autotest_detail_section' "$SRC" &&
   grep -Fq 'local value=\"$2\"' "$SRC" &&
   grep -Fq 'autotest_write_detail_outputs' "$SRC" &&
@@ -301,8 +306,8 @@ test_detail_result_source() {
   grep -Fq 'printf '\''%s\\n'\'' \"$value\" | cat -v' "$SRC" &&
   grep -Fq 'AUTOTEST_DETAIL_SAFE:-0}' "$SRC" &&
   grep -Fq 'cat -v' "$SRC" &&
-  grep -Fq 'autotest_detail_value \"expected $name\" \"$expected\"' "$SRC" &&
-  grep -Fq 'autotest_detail_value \"actual $name\" \"$value\"' "$SRC" &&
+  grep -Fq 'autotest_detail_check_value \"$check_failed\" \"expected $name\" \"$expected\"' "$SRC" &&
+  grep -Fq 'autotest_detail_check_value \"$check_failed\" \"actual $name\" \"$value\"' "$SRC" &&
   grep -Fq 'value_ref=\"actual_value_$i\"' "$SRC" &&
   grep -Fq 'expected_ref=\"expected_value_$i\"' "$SRC" &&
   grep -Fq 'value=\"${!value_ref}\"' "$SRC" &&
