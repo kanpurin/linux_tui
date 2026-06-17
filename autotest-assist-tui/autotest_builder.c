@@ -346,6 +346,7 @@ static void summarize_multiline(char *dst, size_t dst_sz, const char *src) {
 }
 
 static bool editor_is_text_char(wint_t ch) {
+    if (ch >= KEY_MIN && ch <= KEY_MAX) return false;
     return ch >= 0x80 || (ch < 0x80 && isprint((unsigned char)ch));
 }
 

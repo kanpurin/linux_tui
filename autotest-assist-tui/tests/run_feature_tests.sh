@@ -472,6 +472,8 @@ int main(void) {
     init_app(&app);
     editor_insert_wchar(&app, 0x3042);
     if (memcmp(app.editor_lines[0], jp, 3) != 0) return 6;
+    if (editor_is_text_char(KEY_DOWN)) return 7;
+    if (editor_is_text_char(KEY_UP)) return 8;
     app.editor_lines[0][0] = '\0';
     app.editor_col = 0;
     load_editor_text(&app, jp);
