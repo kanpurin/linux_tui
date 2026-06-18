@@ -115,6 +115,7 @@ typedef struct {
     int editor_line_count;
     int editor_row;
     int editor_col;
+    int editor_first_row;
     bool editor_insert;
     bool editor_command_mode;
     bool editor_search_mode;
@@ -536,6 +537,7 @@ static void load_editor_text(App *app, const char *src) {
     app->editor_line_count = 1;
     app->editor_row = 0;
     app->editor_col = 0;
+    app->editor_first_row = 0;
     app->editor_insert = false;
     app->editor_command_mode = false;
     app->editor_search_mode = false;
@@ -584,6 +586,29 @@ static void save_editor_text(App *app, char *dst, size_t dst_sz) {
         if (r + 1 < app->editor_line_count) dst[pos++] = '\n';
     }
     dst[pos] = '\0';
+}
+
+static int editor_visible_rows(const App *app, int height) {
+    int rows = height - 9;
+    if (app->editor_command_mode || app->editor_search_mode) rows = height - 10;
+    if (rows < 1) rows = 1;
+    return rows;
+}
+
+static void editor_clamp_scroll(App *app, int rows) {
+    int max_first = app->editor_line_count > rows ? app->editor_line_count - rows : 0;
+    if (app->editor_first_row < 0) app->editor_first_row = 0;
+    if (app->editor_first_row > max_first) app->editor_first_row = max_first;
+}
+
+static void editor_ensure_cursor_visible(App *app, int rows) {
+    editor_clamp_scroll(app, rows);
+    if (app->editor_row < app->editor_first_row) {
+        app->editor_first_row = app->editor_row;
+    } else if (app->editor_row >= app->editor_first_row + rows) {
+        app->editor_first_row = app->editor_row - rows + 1;
+    }
+    editor_clamp_scroll(app, rows);
 }
 
 static void print_raw_script_text(const char *text) {
@@ -1892,17 +1917,13 @@ static int draw_wrapped_text(int y, int x, int w, int max_rows, const char *text
         if (bytes >= (int)sizeof(buf)) bytes = (int)sizeof(buf) - 1;
         memcpy(buf, line, (size_t)bytes);
         buf[bytes] = '\0';
-        if (line[bytes] && line[bytes] != '\n' && row + 1 == max_rows && w > 3) {
-            int cut = utf8_prev_index(buf, bytes);
-            if (cut > 0) copy_text(buf + cut, sizeof(buf) - (size_t)cut, "...");
-        }
-        print_clip(y + row, x, w, buf);
+        print_editor_line(y + row, x, w, buf);
         row++;
         p = line + bytes;
         if (*p == '\n') p++;
     }
     while (row < max_rows) {
-        print_clip(y + row, x, w, "");
+        print_editor_line(y + row, x, w, "");
         row++;
     }
     return row;
@@ -1970,7 +1991,6 @@ static void draw_case_details(const App *app, int y, int x, int h, int w) {
     const TestCase *tc = &app->project.cases[app->selected_case];
     int check_count = command_check_count(tc->command);
     int line = y + 1;
-    int desc_rows = h > 16 ? 4 : 2;
     mvprintw(line++, x + 1, "id: %s", tc->id);
     mvprintw(line++, x + 1, "title: %.*s", w - 9, tc->title);
     mvprintw(line++, x + 1, "kind: %s  selected: %s", command_kind_name(tc->kind), tc->selected ? "yes" : "no");
@@ -1984,7 +2004,8 @@ static void draw_case_details(const App *app, int y, int x, int h, int w) {
     mvprintw(line++, x + 1, "reboot: auto %s", tc->kind == CMD_REBOOT ? "detected" : "none");
     if (line < y + h - 1) mvprintw(line++, x + 1, "path: %.*s", w - 8, tc->script_path[0] ? tc->script_path : "<not saved>");
     if (line < y + h - 1) mvprintw(line++, x + 1, "description:");
-    if (line < y + h - 1) draw_wrapped_text(line, x + 1, w - 3, desc_rows, tc->description);
+    int desc_rows = y + h - 1 - line;
+    if (desc_rows > 0) draw_wrapped_text(line, x + 1, w - 3, desc_rows, tc->description);
 }
 
 static void draw_dashboard(const App *app, int height, int width) {
@@ -2152,12 +2173,11 @@ static void draw_script_editor(const App *app, int height, int width) {
         mvprintw(4, 2, "%s %s", tc->id, tc->title);
     }
     bool regex_templates = editor_uses_regex_templates(app);
-    int rows = height - 9;
-    if (app->editor_command_mode || app->editor_search_mode) rows = height - 10;
-    if (rows < 1) rows = 1;
-    int first_row = 0;
-    if (app->editor_row >= rows) first_row = app->editor_row - rows + 1;
+    int rows = editor_visible_rows(app, height);
+    int first_row = app->editor_first_row;
+    int max_first = app->editor_line_count > rows ? app->editor_line_count - rows : 0;
     if (first_row < 0) first_row = 0;
+    if (first_row > max_first) first_row = max_first;
     for (int i = 0; i < rows && first_row + i < app->editor_line_count; i++) {
         int line_index = first_row + i;
         int y = 6 + i;
@@ -2909,6 +2929,7 @@ static void handle_script_editor_key(App *app, int ch) {
         }
         int len = (int)strlen(app->editor_lines[app->editor_row]);
         if (app->editor_col > len) app->editor_col = len;
+        editor_ensure_cursor_visible(app, editor_visible_rows(app, LINES));
         return;
     }
 
@@ -3022,6 +3043,9 @@ static void handle_script_editor_key(App *app, int ch) {
             app->editor_command[0] = '\0';
             app->editor_command_mode = false;
         }
+        if (app->screen == SCREEN_SCRIPT_EDITOR) {
+            editor_ensure_cursor_visible(app, editor_visible_rows(app, LINES));
+        }
         return;
     }
 
@@ -3046,6 +3070,7 @@ static void handle_script_editor_key(App *app, int ch) {
             append_wchar_utf8(app->editor_search, &app->editor_search_len,
                               sizeof(app->editor_search), (wint_t)ch);
         }
+        editor_ensure_cursor_visible(app, editor_visible_rows(app, LINES));
         return;
     }
 
@@ -3075,6 +3100,7 @@ static void handle_script_editor_key(App *app, int ch) {
     if (editor_handle_normal_sequence(app, ch)) {
         int len = (int)strlen(app->editor_lines[app->editor_row]);
         if (app->editor_col > len) app->editor_col = len;
+        editor_ensure_cursor_visible(app, editor_visible_rows(app, LINES));
         return;
     }
 
@@ -3171,6 +3197,7 @@ static void handle_script_editor_key(App *app, int ch) {
     }
     int len = (int)strlen(app->editor_lines[app->editor_row]);
     if (app->editor_col > len) app->editor_col = len;
+    editor_ensure_cursor_visible(app, editor_visible_rows(app, LINES));
 }
 
 static void add_case(App *app) {

@@ -433,6 +433,11 @@ test_editor_source() {
   grep -Fq 'editor_handle_insert_escape_sequence' "$SRC" &&
   grep -Fq 'indent_len' "$SRC" &&
   grep -Fq 'app->editor_col = copy_indent' "$SRC" &&
+  grep -Fq 'editor_first_row' "$SRC" &&
+  grep -Fq 'editor_ensure_cursor_visible' "$SRC" &&
+  grep -Fq 'app->editor_row < app->editor_first_row' "$SRC" &&
+  grep -Fq 'app->editor_row >= app->editor_first_row + rows' "$SRC" &&
+  grep -Fq 'int first_row = app->editor_first_row' "$SRC" &&
   grep -Fq 'set_escdelay(150)' "$SRC" &&
   grep -Fq 'setlocale(LC_ALL, "")' "$SRC" &&
   grep -Fq 'meta(stdscr, TRUE)' "$SRC" &&
@@ -556,8 +561,11 @@ test_description_source() {
   grep -Fq 'char description[LONG_LEN]' "$SRC" &&
   grep -Fq 'description:' "$SRC" &&
   grep -Fq 'draw_wrapped_text' "$SRC" &&
-  grep -Fq 'desc_rows' "$SRC" &&
+  grep -Fq 'desc_rows = y + h - 1 - line' "$SRC" &&
   grep -Fq 'draw_wrapped_text(line' "$SRC" &&
+  grep -Fq 'print_editor_line(y + row, x, w, buf)' "$SRC" &&
+  grep -Fq 'print_editor_line(y + row, x, w, "")' "$SRC" &&
+  ! grep -Fq 'copy_text(buf + cut' "$SRC" &&
   ! grep -Fq 'desc_y = y + h - desc_rows - 1' "$SRC" &&
   grep -Fq 'write_comment_block(f, "Title", tc->title)' "$SRC" &&
   grep -Fq 'write_comment_block(f, "Description", tc->description)' "$SRC" &&
