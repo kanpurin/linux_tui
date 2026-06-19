@@ -418,10 +418,19 @@ test_editor_source() {
   grep -Fq 'print_current_test_script' "$SRC" &&
   grep -Fq 'strcmp(app->editor_command, "print")' "$SRC" &&
   grep -Fq 'print_editor_script(app)' "$SRC" &&
+  grep -Fq 'editor_dirty' "$SRC" &&
+  grep -Fq 'strcmp(app->editor_command, "w")' "$SRC" &&
+  grep -Fq 'strcmp(app->editor_command, "q!")' "$SRC" &&
+  grep -Fq 'E37: No write since last change (add ! to override)' "$SRC" &&
+  grep -Fq 'set_editor_written_status' "$SRC" &&
+  grep -Fq -- '-- INSERT --' "$SRC" &&
   grep -Fq 'first_row = app->editor_row - rows + 1' "$SRC" &&
   grep -Fq 'line_index = first_row + i' "$SRC" &&
   grep -Fq 'app->editor_row - first_row' "$SRC" &&
   grep -Fq 'editor_copy_lines' "$SRC" &&
+  grep -Fq 'editor_start_line_range' "$SRC" &&
+  grep -Fq 'editor_apply_line_range' "$SRC" &&
+  grep -Fq 'editor_range_pending' "$SRC" &&
   grep -Fq 'editor_paste_lines' "$SRC" &&
   grep -Fq 'editor_search_next' "$SRC" &&
   grep -Fq 'editor_goto_line' "$SRC" &&
@@ -430,10 +439,19 @@ test_editor_source() {
   grep -Fq 'strcmp(app->editor_command, "help")' "$SRC" &&
   grep -Fq 'app->editor_target == EDIT_TARGET_COMMAND) return true' "$SRC" &&
   grep -Fq 'strcmp(app->editor_command, "template")' "$SRC" &&
-  grep -Fq 'editor_handle_insert_escape_sequence' "$SRC" &&
+  grep -Fq 'editor_handle_escape_sequence' "$SRC" &&
+  grep -Fq 'if (!editor_handle_escape_sequence(app))' "$SRC" &&
+  grep -Fq "seq[0] == '[' && n >= 2" "$SRC" &&
+  grep -Fq "seq[n - 1] == 'H'" "$SRC" &&
+  grep -Fq "seq[n - 1] == 'F'" "$SRC" &&
+  grep -Fq 'first_param == 1 || first_param == 7' "$SRC" &&
+  grep -Fq 'first_param == 4 || first_param == 8' "$SRC" &&
   grep -Fq 'indent_len' "$SRC" &&
   grep -Fq 'app->editor_col = copy_indent' "$SRC" &&
   grep -Fq 'editor_first_row' "$SRC" &&
+  grep -Fq 'editor_desired_col' "$SRC" &&
+  grep -Fq 'editor_index_for_visual_col' "$SRC" &&
+  grep -Fq 'editor_move_vertical' "$SRC" &&
   grep -Fq 'editor_ensure_cursor_visible' "$SRC" &&
   grep -Fq 'app->editor_row < app->editor_first_row' "$SRC" &&
   grep -Fq 'app->editor_row >= app->editor_first_row + rows' "$SRC" &&
@@ -454,7 +472,7 @@ test_editor_source() {
   grep -Fq 'app->selected_case = (app->selected_case + 1) % app->project.case_count' "$SRC" &&
   grep -Fq 'Edit description' "$SRC" &&
   grep -Fq 'EDIT_TARGET_DESCRIPTION' "$SRC" &&
-  grep -Fq 'Saved description.' "$SRC" &&
+  grep -Fq 'editor_has_unsaved_changes' "$SRC" &&
   ! grep -Fq 'Arrow move  i insert' "$SRC" &&
   ! grep -Fq 'Regex templates: :template' "$SRC" &&
   grep -Fq 'ch == KEY_DOWN' "$SRC" &&
@@ -489,6 +507,28 @@ int main(void) {
     app.editor_col = 3;
     editor_backspace(&app);
     if (strcmp(app.editor_lines[0], "A") != 0) return 5;
+    load_editor_text(&app, "abcdef\nx\nabcdef\n");
+    app.editor_col = 5;
+    editor_update_desired_col(&app);
+    editor_move_vertical(&app, 1);
+    if (app.editor_row != 1 || app.editor_col != 1 || app.editor_desired_col != 5) return 9;
+    editor_move_vertical(&app, 1);
+    if (app.editor_row != 2 || app.editor_col != 5 || app.editor_desired_col != 5) return 10;
+    load_editor_text(&app, "one\ntwo\nthree\nfour");
+    app.editor_row = 1;
+    editor_start_line_range(&app, 'y');
+    app.editor_row = 3;
+    if (!editor_apply_line_range(&app, 'y')) return 11;
+    if (app.editor_clipboard_count != 3) return 12;
+    if (strcmp(app.editor_clipboard[0], "two") != 0 ||
+        strcmp(app.editor_clipboard[1], "three") != 0 ||
+        strcmp(app.editor_clipboard[2], "four") != 0) return 13;
+    load_editor_text(&app, "one\ntwo\nthree\nfour");
+    app.editor_row = 2;
+    editor_start_line_range(&app, 'd');
+    app.editor_row = 0;
+    if (!editor_apply_line_range(&app, 'd')) return 14;
+    if (app.editor_line_count != 1 || strcmp(app.editor_lines[0], "four") != 0) return 15;
     return 0;
 }
 EOF

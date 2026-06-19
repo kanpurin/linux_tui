@@ -115,11 +115,16 @@ typedef struct {
     int editor_line_count;
     int editor_row;
     int editor_col;
+    int editor_desired_col;
     int editor_first_row;
     bool editor_insert;
     bool editor_command_mode;
     bool editor_search_mode;
+    bool editor_dirty;
     bool editor_new_case;
+    bool editor_range_pending;
+    char editor_range_op;
+    int editor_range_anchor;
     bool regex_template_list_open;
     bool editor_help_open;
     int editor_help_scroll;
@@ -222,7 +227,7 @@ static const char *EDITOR_HELP_LINES[] = {
     "unknown option                  Show usage and exit with error.",
     "",
     "Editor normal mode",
-    "i insert, :wq save, :q cancel, :template regex templates.",
+    "i insert, :w save, :wq save quit, :q quit, :q! quit without save.",
     "dd / dNd delete lines, yy / yNy copy lines, p / P paste.",
     "u undo, gg / G / nG jump, /word search, n / N next/previous."
 };
@@ -390,6 +395,30 @@ static int editor_visual_col(const char *line, int col) {
     return visual;
 }
 
+static int editor_index_for_visual_col(const char *line, int target_col) {
+    int visual = 0;
+    int i = 0;
+    if (target_col <= 0) return 0;
+    while (line && line[i]) {
+        int char_w = utf8_char_width_at(line, i);
+        if (visual + char_w > target_col) break;
+        visual += char_w;
+        i += utf8_char_len_at(line, i);
+    }
+    return i;
+}
+
+static void editor_update_desired_col(App *app) {
+    app->editor_desired_col = editor_visual_col(app->editor_lines[app->editor_row], app->editor_col);
+}
+
+static void editor_move_vertical(App *app, int delta) {
+    int row = app->editor_row + delta;
+    if (row < 0 || row >= app->editor_line_count) return;
+    app->editor_row = row;
+    app->editor_col = editor_index_for_visual_col(app->editor_lines[app->editor_row], app->editor_desired_col);
+}
+
 static void print_editor_line(int y, int x, int w, const char *line) {
     int cx = x;
     for (int i = 0; line && line[i] && cx < x + w;) {
@@ -537,10 +566,15 @@ static void load_editor_text(App *app, const char *src) {
     app->editor_line_count = 1;
     app->editor_row = 0;
     app->editor_col = 0;
+    app->editor_desired_col = 0;
     app->editor_first_row = 0;
     app->editor_insert = false;
     app->editor_command_mode = false;
     app->editor_search_mode = false;
+    app->editor_dirty = false;
+    app->editor_range_pending = false;
+    app->editor_range_op = '\0';
+    app->editor_range_anchor = 0;
     app->editor_command_len = 0;
     app->editor_command[0] = '\0';
     app->editor_normal_command_len = 0;
@@ -1682,7 +1716,7 @@ static void open_text_editor(App *app, EditorTarget target, Screen return_screen
     load_editor_from_case(app);
     app->screen = SCREEN_SCRIPT_EDITOR;
     app->selected_menu = 0;
-    set_status(app, "Text editor: i insert, Esc normal, :wq save, :q cancel.");
+    set_status(app, "Text editor: i insert, Esc normal, :w save, :wq save quit, :q! discard.");
 }
 
 static void open_script_editor(App *app) {
@@ -1699,6 +1733,72 @@ static void discard_current_case_if_new(App *app) {
     app->project.case_count--;
     app->editor_new_case = false;
     clamp_selected(app);
+}
+
+static bool editor_has_unsaved_changes(const App *app) {
+    return app->editor_dirty ||
+           (app->editor_new_case && app->editor_target == EDIT_TARGET_COMMAND);
+}
+
+static int editor_buffer_bytes(const App *app) {
+    int bytes = 0;
+    for (int i = 0; i < app->editor_line_count; i++) {
+        bytes += (int)strlen(app->editor_lines[i]);
+        if (i + 1 < app->editor_line_count) bytes++;
+    }
+    return bytes;
+}
+
+static void set_editor_written_status(App *app, const char *name) {
+    snprintf(app->status, sizeof(app->status), "\"%s\" %dL, %dB written",
+             name, app->editor_line_count, editor_buffer_bytes(app));
+}
+
+static bool save_current_editor(App *app, bool exit_after_save) {
+    if (app->editor_target == EDIT_TARGET_COMMAND) {
+        char candidate[LONG_LEN];
+        SyntaxError err;
+        save_editor_text(app, candidate, sizeof(candidate));
+        if (!validate_script_syntax(candidate, &err)) {
+            if (err.line_no > 0) {
+                snprintf(app->status, sizeof(app->status),
+                         "Syntax error line %d: %s", err.line_no, err.message);
+            } else {
+                snprintf(app->status, sizeof(app->status),
+                         "Syntax error: %s", err.message);
+            }
+            return false;
+        }
+    }
+
+    save_editor_to_case(app);
+    if (app->editor_target == EDIT_TARGET_COMMAND) {
+        int rc = write_single_test_script(&app->project.cases[app->selected_case]);
+        if (rc == 0) {
+            TestCase *tc = &app->project.cases[app->selected_case];
+            save_test_registry(&app->project);
+            app->editor_new_case = false;
+            app->editor_dirty = false;
+            set_editor_written_status(app, tc->script_path[0] ? tc->script_path : tc->title);
+            if (exit_after_save) app->screen = app->previous_screen;
+            return true;
+        }
+        if (rc == -2) {
+            set_status(app, "Script name already exists in this directory.");
+        } else {
+            set_status(app, "Failed to save test script.");
+        }
+        return false;
+    }
+
+    if (app->project.cases[app->selected_case].script_path[0]) {
+        write_single_test_script(&app->project.cases[app->selected_case]);
+    }
+    save_test_registry(&app->project);
+    app->editor_dirty = false;
+    set_editor_written_status(app, editor_target_name(app->editor_target));
+    if (exit_after_save) app->screen = app->previous_screen;
+    return true;
 }
 
 static void shell_quote(FILE *f, const char *s) {
@@ -2187,10 +2287,13 @@ static void draw_script_editor(const App *app, int height, int width) {
             draw_editor_cursor(app, y, 7, width - 9, app->editor_lines[line_index]);
         }
     }
-    if (!app->editor_insert && app->editor_command_mode) {
+    if (app->editor_insert) {
+        mvhline(height - 4, 1, ' ', width - 2);
+        mvprintw(height - 4, 2, "-- INSERT --");
+    } else if (app->editor_command_mode) {
         mvhline(height - 4, 1, ' ', width - 2);
         mvprintw(height - 4, 2, ":%s", app->editor_command);
-    } else if (!app->editor_insert && app->editor_search_mode) {
+    } else if (app->editor_search_mode) {
         mvhline(height - 4, 1, ' ', width - 2);
         mvprintw(height - 4, 2, "/%s", app->editor_search);
     }
@@ -2547,6 +2650,7 @@ static void set_vim_command(TestCase *tc) {
 }
 
 static void editor_save_undo(App *app) {
+    app->editor_dirty = true;
     if (app->editor_undo_count >= EDITOR_UNDO_DEPTH) {
         memmove(app->editor_undo_lines, app->editor_undo_lines + 1, sizeof(app->editor_undo_lines[0]) * (EDITOR_UNDO_DEPTH - 1));
         memmove(app->editor_undo_line_count, app->editor_undo_line_count + 1, sizeof(app->editor_undo_line_count[0]) * (EDITOR_UNDO_DEPTH - 1));
@@ -2571,6 +2675,7 @@ static void editor_undo(App *app) {
     app->editor_line_count = app->editor_undo_line_count[slot];
     app->editor_row = app->editor_undo_row[slot];
     app->editor_col = app->editor_undo_col[slot];
+    editor_update_desired_col(app);
     set_status(app, "Undo.");
 }
 
@@ -2584,6 +2689,7 @@ static void editor_insert_char(App *app, int ch) {
     memmove(line + app->editor_col + 1, line + app->editor_col, (size_t)(len - app->editor_col + 1));
     line[app->editor_col] = (char)ch;
     app->editor_col++;
+    editor_update_desired_col(app);
 }
 
 static void editor_insert_bytes(App *app, const char *bytes, int byte_count) {
@@ -2598,6 +2704,7 @@ static void editor_insert_bytes(App *app, const char *bytes, int byte_count) {
             (size_t)(len - app->editor_col + 1));
     memcpy(line + app->editor_col, bytes, (size_t)byte_count);
     app->editor_col += byte_count;
+    editor_update_desired_col(app);
 }
 
 static void editor_insert_wchar(App *app, wint_t ch) {
@@ -2670,6 +2777,7 @@ static void editor_newline(App *app) {
     app->editor_line_count++;
     app->editor_row++;
     app->editor_col = copy_indent;
+    editor_update_desired_col(app);
 }
 
 static void editor_backspace(App *app) {
@@ -2680,6 +2788,7 @@ static void editor_backspace(App *app) {
         editor_save_undo(app);
         memmove(line + prev, line + app->editor_col, (size_t)(len - app->editor_col + 1));
         app->editor_col = prev;
+        editor_update_desired_col(app);
     } else if (app->editor_row > 0) {
         int prev_len = (int)strlen(app->editor_lines[app->editor_row - 1]);
         if (prev_len + len + 1 < EDITOR_COLS) {
@@ -2691,6 +2800,7 @@ static void editor_backspace(App *app) {
             app->editor_line_count--;
             app->editor_row--;
             app->editor_col = prev_len;
+            editor_update_desired_col(app);
         }
     }
 }
@@ -2718,6 +2828,7 @@ static void editor_delete_lines(App *app, int count) {
     if (app->editor_row >= app->editor_line_count) app->editor_row = app->editor_line_count - 1;
     int len = (int)strlen(app->editor_lines[app->editor_row]);
     if (app->editor_col > len) app->editor_col = len;
+    editor_update_desired_col(app);
 }
 
 static void editor_copy_lines(App *app, int count) {
@@ -2730,6 +2841,79 @@ static void editor_copy_lines(App *app, int count) {
         copy_text(app->editor_clipboard[i], EDITOR_COLS, app->editor_lines[app->editor_row + i]);
     }
     set_status(app, "Copied line(s).");
+}
+
+static void editor_copy_line_range(App *app, int start, int end) {
+    if (start > end) {
+        int tmp = start;
+        start = end;
+        end = tmp;
+    }
+    if (start < 0) start = 0;
+    if (end >= app->editor_line_count) end = app->editor_line_count - 1;
+    int count = end - start + 1;
+    if (count < 1) return;
+    app->editor_clipboard_count = count;
+    for (int i = 0; i < count; i++) {
+        copy_text(app->editor_clipboard[i], EDITOR_COLS, app->editor_lines[start + i]);
+    }
+    snprintf(app->status, sizeof(app->status), "Copied %d line(s).", count);
+}
+
+static void editor_set_range_status(App *app) {
+    int start = app->editor_range_anchor;
+    int end = app->editor_row;
+    if (start > end) {
+        int tmp = start;
+        start = end;
+        end = tmp;
+    }
+    snprintf(app->status, sizeof(app->status), "%c range: line %d to %d",
+             app->editor_range_op, start + 1, end + 1);
+}
+
+static void editor_cancel_line_range(App *app) {
+    app->editor_range_pending = false;
+    app->editor_range_op = '\0';
+    app->editor_range_anchor = 0;
+    app->editor_normal_command_len = 0;
+    app->editor_normal_command[0] = '\0';
+}
+
+static void editor_start_line_range(App *app, char op) {
+    app->editor_range_pending = true;
+    app->editor_range_op = op;
+    app->editor_range_anchor = app->editor_row;
+    editor_set_range_status(app);
+}
+
+static bool editor_apply_line_range(App *app, char op) {
+    if (!app->editor_range_pending || app->editor_range_op != op) return false;
+    int start = app->editor_range_anchor;
+    int end = app->editor_row;
+    if (start > end) {
+        int tmp = start;
+        start = end;
+        end = tmp;
+    }
+    int count = end - start + 1;
+    if (op == 'y') {
+        editor_copy_line_range(app, start, end);
+    } else if (op == 'd') {
+        app->editor_row = start;
+        editor_delete_lines(app, count);
+        snprintf(app->status, sizeof(app->status), "Deleted %d line(s).", count);
+    } else {
+        editor_cancel_line_range(app);
+        return false;
+    }
+    editor_cancel_line_range(app);
+    return true;
+}
+
+static bool editor_is_range_motion_key(int ch) {
+    return ch == KEY_UP || ch == KEY_DOWN || ch == 'j' || ch == 'k' ||
+           ch == 'G' || ch == 'n' || ch == 'N';
 }
 
 static void editor_paste_lines(App *app, bool above) {
@@ -2756,6 +2940,7 @@ static void editor_paste_lines(App *app, bool above) {
     app->editor_line_count += count;
     app->editor_row = insert_at;
     app->editor_col = 0;
+    editor_update_desired_col(app);
     set_status(app, "Pasted line(s).");
 }
 
@@ -2772,6 +2957,7 @@ static bool editor_search_next(App *app, int direction) {
         if (pos) {
             app->editor_row = row;
             app->editor_col = (int)(pos - app->editor_lines[row]);
+            editor_update_desired_col(app);
             set_status(app, "Found.");
             return true;
         }
@@ -2786,6 +2972,7 @@ static void editor_goto_line(App *app, int row) {
     app->editor_row = row;
     int len = (int)strlen(app->editor_lines[app->editor_row]);
     if (app->editor_col > len) app->editor_col = len;
+    editor_update_desired_col(app);
 }
 
 static bool editor_handle_normal_sequence(App *app, int ch) {
@@ -2794,25 +2981,25 @@ static bool editor_handle_normal_sequence(App *app, int ch) {
         return false;
     }
     if (ch == 27) {
-        app->editor_normal_command_len = 0;
-        app->editor_normal_command[0] = '\0';
+        editor_cancel_line_range(app);
         return true;
     }
     if (ch < 0 || ch > 127 || !isprint((unsigned char)ch)) {
-        app->editor_normal_command_len = 0;
-        app->editor_normal_command[0] = '\0';
+        editor_cancel_line_range(app);
         return false;
     }
     int len = app->editor_normal_command_len;
     if (len + 1 >= (int)sizeof(app->editor_normal_command)) {
-        app->editor_normal_command_len = 0;
-        app->editor_normal_command[0] = '\0';
+        editor_cancel_line_range(app);
         return true;
     }
     if (len == 0) {
         app->editor_normal_command[len++] = (char)ch;
         app->editor_normal_command[len] = '\0';
         app->editor_normal_command_len = len;
+        if (ch == 'd' || ch == 'y') {
+            editor_start_line_range(app, (char)ch);
+        }
         return true;
     }
     char first = app->editor_normal_command[0];
@@ -2824,8 +3011,7 @@ static bool editor_handle_normal_sequence(App *app, int ch) {
     else if (first == 'g' && len == 1 && ch == 'g') valid = true;
     else if (isdigit((unsigned char)first) && (isdigit((unsigned char)ch) || ch == 'G')) valid = true;
     if (!valid) {
-        app->editor_normal_command_len = 0;
-        app->editor_normal_command[0] = '\0';
+        editor_cancel_line_range(app);
         return false;
     }
     app->editor_normal_command[len++] = (char)ch;
@@ -2840,30 +3026,28 @@ static bool editor_handle_normal_sequence(App *app, int ch) {
         }
         if (first == 'd') editor_delete_lines(app, count);
         else editor_copy_lines(app, count);
-        app->editor_normal_command_len = 0;
-        app->editor_normal_command[0] = '\0';
+        editor_cancel_line_range(app);
     } else if (first == 'g' && ch == 'g') {
         editor_goto_line(app, 0);
-        app->editor_normal_command_len = 0;
-        app->editor_normal_command[0] = '\0';
+        editor_cancel_line_range(app);
     } else if (isdigit((unsigned char)first) && ch == 'G') {
         int line_no = atoi(app->editor_normal_command);
         editor_goto_line(app, line_no - 1);
-        app->editor_normal_command_len = 0;
-        app->editor_normal_command[0] = '\0';
+        editor_cancel_line_range(app);
     }
     return true;
 }
 
-static bool editor_handle_insert_escape_sequence(App *app) {
-    int seq[8];
+static bool editor_handle_escape_sequence(App *app) {
+    int seq[16];
     int n = 0;
     nodelay(stdscr, TRUE);
     for (int i = 0; i < (int)(sizeof(seq) / sizeof(seq[0])); i++) {
         int c = read_tui_input();
         if (c == ERR) break;
         seq[n++] = c;
-        if ((c >= '@' && c <= '~') || c == '~') break;
+        if (seq[0] == 'O' && n >= 2) break;
+        if (seq[0] == '[' && n >= 2 && c >= '@' && c <= '~') break;
     }
     nodelay(stdscr, FALSE);
     if (n == 0) return false;
@@ -2871,22 +3055,30 @@ static bool editor_handle_insert_escape_sequence(App *app) {
     bool handled = false;
     if (n >= 2 && seq[0] == '[' && seq[1] == 'H') {
         app->editor_col = 0;
+        editor_update_desired_col(app);
         handled = true;
     } else if (n >= 2 && seq[0] == '[' && seq[1] == 'F') {
         app->editor_col = (int)strlen(app->editor_lines[app->editor_row]);
+        editor_update_desired_col(app);
         handled = true;
     } else if (n >= 2 && seq[0] == 'O' && seq[1] == 'H') {
         app->editor_col = 0;
+        editor_update_desired_col(app);
         handled = true;
     } else if (n >= 2 && seq[0] == 'O' && seq[1] == 'F') {
         app->editor_col = (int)strlen(app->editor_lines[app->editor_row]);
+        editor_update_desired_col(app);
         handled = true;
-    } else if (n >= 3 && seq[0] == '[' && seq[2] == '~') {
-        if (seq[1] == '1' || seq[1] == '7') {
+    } else if (n >= 3 && seq[0] == '[') {
+        int first_param = -1;
+        if (isdigit((unsigned char)seq[1])) first_param = seq[1] - '0';
+        if (seq[n - 1] == 'H' || (seq[n - 1] == '~' && (first_param == 1 || first_param == 7))) {
             app->editor_col = 0;
+            editor_update_desired_col(app);
             handled = true;
-        } else if (seq[1] == '4' || seq[1] == '8') {
+        } else if (seq[n - 1] == 'F' || (seq[n - 1] == '~' && (first_param == 4 || first_param == 8))) {
             app->editor_col = (int)strlen(app->editor_lines[app->editor_row]);
+            editor_update_desired_col(app);
             handled = true;
         }
     }
@@ -2899,7 +3091,7 @@ static bool editor_handle_insert_escape_sequence(App *app) {
 static void handle_script_editor_key(App *app, int ch) {
     if (app->editor_insert) {
         if (ch == 27) {
-            if (!editor_handle_insert_escape_sequence(app)) {
+            if (!editor_handle_escape_sequence(app)) {
                 app->editor_insert = false;
                 curs_set(0);
             }
@@ -2909,19 +3101,23 @@ static void handle_script_editor_key(App *app, int ch) {
             editor_backspace(app);
         } else if (ch == KEY_LEFT && app->editor_col > 0) {
             app->editor_col = utf8_prev_index(app->editor_lines[app->editor_row], app->editor_col);
+            editor_update_desired_col(app);
         } else if (ch == KEY_RIGHT) {
             int len = (int)strlen(app->editor_lines[app->editor_row]);
             if (app->editor_col < len) {
                 app->editor_col = utf8_next_index(app->editor_lines[app->editor_row], app->editor_col);
+                editor_update_desired_col(app);
             }
         } else if (ch == KEY_HOME) {
             app->editor_col = 0;
+            editor_update_desired_col(app);
         } else if (ch == KEY_END) {
             app->editor_col = (int)strlen(app->editor_lines[app->editor_row]);
+            editor_update_desired_col(app);
         } else if (ch == KEY_UP && app->editor_row > 0) {
-            app->editor_row--;
+            editor_move_vertical(app, -1);
         } else if (ch == KEY_DOWN && app->editor_row + 1 < app->editor_line_count) {
-            app->editor_row++;
+            editor_move_vertical(app, 1);
         } else if (ch == '\t') {
             editor_insert_char(app, '\t');
         } else if (editor_is_text_char(ch)) {
@@ -2965,50 +3161,20 @@ static void handle_script_editor_key(App *app, int ch) {
     if (app->editor_command_mode) {
         if (ch == '\n' || ch == KEY_ENTER) {
             app->editor_command[app->editor_command_len] = '\0';
-            if (strcmp(app->editor_command, "wq") == 0) {
-                bool can_save = true;
-                if (app->editor_target == EDIT_TARGET_COMMAND) {
-                    char candidate[LONG_LEN];
-                    SyntaxError err;
-                    save_editor_text(app, candidate, sizeof(candidate));
-                    if (!validate_script_syntax(candidate, &err)) {
-                        if (err.line_no > 0) {
-                            snprintf(app->status, sizeof(app->status),
-                                     "Syntax error line %d: %s", err.line_no, err.message);
-                        } else {
-                            snprintf(app->status, sizeof(app->status),
-                                     "Syntax error: %s", err.message);
-                        }
-                        can_save = false;
-                    }
-                }
-                if (can_save) {
-                    save_editor_to_case(app);
-                    if (app->editor_target == EDIT_TARGET_COMMAND) {
-                        int rc = write_single_test_script(&app->project.cases[app->selected_case]);
-                        if (rc == 0) {
-                            save_test_registry(&app->project);
-                            set_status(app, "Saved test script.");
-                            app->editor_new_case = false;
-                            app->screen = app->previous_screen;
-                        } else if (rc == -2) {
-                            set_status(app, "Script name already exists in this directory.");
-                        } else {
-                            set_status(app, "Failed to save test script.");
-                        }
-                    } else if (app->editor_target != EDIT_TARGET_COMMAND) {
-                        if (app->project.cases[app->selected_case].script_path[0]) {
-                            write_single_test_script(&app->project.cases[app->selected_case]);
-                        }
-                        save_test_registry(&app->project);
-                        set_status(app, app->editor_target == EDIT_TARGET_DESCRIPTION ? "Saved description." : "Saved variable expectation.");
-                        app->screen = app->previous_screen;
-                    } else {
-                        set_status(app, "Failed to save test script.");
-                    }
-                }
+            if (strcmp(app->editor_command, "w") == 0) {
+                save_current_editor(app, false);
+            } else if (strcmp(app->editor_command, "wq") == 0) {
+                save_current_editor(app, true);
             } else if (strcmp(app->editor_command, "q") == 0) {
+                if (editor_has_unsaved_changes(app)) {
+                    set_status(app, "E37: No write since last change (add ! to override)");
+                } else {
+                    app->screen = app->previous_screen;
+                    set_status(app, "Canceled script editor.");
+                }
+            } else if (strcmp(app->editor_command, "q!") == 0) {
                 if (app->editor_target == EDIT_TARGET_COMMAND) discard_current_case_if_new(app);
+                app->editor_dirty = false;
                 app->screen = app->previous_screen;
                 set_status(app, "Canceled script editor.");
             } else if (strcmp(app->editor_command, "print") == 0) {
@@ -3097,7 +3263,28 @@ static void handle_script_editor_key(App *app, int ch) {
         }
     }
 
-    if (editor_handle_normal_sequence(app, ch)) {
+    bool allow_normal_sequence = true;
+    if (app->editor_range_pending) {
+        if (ch == 27) {
+            editor_cancel_line_range(app);
+            set_status(app, "Canceled line range.");
+            editor_ensure_cursor_visible(app, editor_visible_rows(app, LINES));
+            return;
+        }
+        if (ch == app->editor_range_op && app->editor_normal_command_len == 1) {
+            editor_apply_line_range(app, (char)ch);
+            editor_ensure_cursor_visible(app, editor_visible_rows(app, LINES));
+            return;
+        }
+        if (editor_is_range_motion_key(ch)) {
+            allow_normal_sequence = false;
+        } else if (!(isdigit((unsigned char)ch) ||
+                     (ch == app->editor_range_op && app->editor_normal_command_len > 1))) {
+            editor_cancel_line_range(app);
+        }
+    }
+
+    if (allow_normal_sequence && editor_handle_normal_sequence(app, ch)) {
         int len = (int)strlen(app->editor_lines[app->editor_row]);
         if (app->editor_col > len) app->editor_col = len;
         editor_ensure_cursor_visible(app, editor_visible_rows(app, LINES));
@@ -3145,16 +3332,17 @@ static void handle_script_editor_key(App *app, int ch) {
         break;
     case KEY_UP:
     case 'k':
-        if (app->editor_row > 0) app->editor_row--;
+        if (app->editor_row > 0) editor_move_vertical(app, -1);
         break;
     case KEY_DOWN:
     case 'j':
-        if (app->editor_row + 1 < app->editor_line_count) app->editor_row++;
+        if (app->editor_row + 1 < app->editor_line_count) editor_move_vertical(app, 1);
         break;
     case KEY_LEFT:
     case 'h':
         if (app->editor_col > 0) {
             app->editor_col = utf8_prev_index(app->editor_lines[app->editor_row], app->editor_col);
+            editor_update_desired_col(app);
         }
         break;
     case KEY_RIGHT:
@@ -3162,16 +3350,19 @@ static void handle_script_editor_key(App *app, int ch) {
         int len = (int)strlen(app->editor_lines[app->editor_row]);
         if (app->editor_col < len) {
             app->editor_col = utf8_next_index(app->editor_lines[app->editor_row], app->editor_col);
+            editor_update_desired_col(app);
         }
         break;
     }
     case KEY_HOME:
     case '0':
         app->editor_col = 0;
+        editor_update_desired_col(app);
         break;
     case KEY_END:
     case '$':
         app->editor_col = (int)strlen(app->editor_lines[app->editor_row]);
+        editor_update_desired_col(app);
         break;
     case 'x': {
         char *line = app->editor_lines[app->editor_row];
@@ -3180,6 +3371,7 @@ static void handle_script_editor_key(App *app, int ch) {
             int next = utf8_next_index(line, app->editor_col);
             editor_save_undo(app);
             memmove(line + app->editor_col, line + next, (size_t)(len - next + 1));
+            editor_update_desired_col(app);
         }
         break;
     }
@@ -3190,13 +3382,18 @@ static void handle_script_editor_key(App *app, int ch) {
         curs_set(1);
         break;
     case 27:
-        set_status(app, "Use :wq to save or :q to cancel.");
+        if (!editor_handle_escape_sequence(app)) {
+            set_status(app, "Type  :w  to write,  :q!  to quit without saving.");
+        }
         break;
     default:
         break;
     }
     int len = (int)strlen(app->editor_lines[app->editor_row]);
     if (app->editor_col > len) app->editor_col = len;
+    if (app->editor_range_pending && editor_is_range_motion_key(ch)) {
+        editor_set_range_status(app);
+    }
     editor_ensure_cursor_visible(app, editor_visible_rows(app, LINES));
 }
 
