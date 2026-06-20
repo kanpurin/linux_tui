@@ -49,7 +49,9 @@ match_value() {
   case "$type" in
     none) return 0 ;;
     exact) AUTOTEST_MATCH_ACTUAL="$actual" AUTOTEST_MATCH_EXPECTED="$expected" awk 'BEGIN { pattern = "^(" ENVIRON["AUTOTEST_MATCH_EXPECTED"] ")$"; exit(ENVIRON["AUTOTEST_MATCH_ACTUAL"] ~ pattern ? 0 : 1) }' ;;
+    not_exact) AUTOTEST_MATCH_ACTUAL="$actual" AUTOTEST_MATCH_EXPECTED="$expected" awk 'BEGIN { pattern = "^(" ENVIRON["AUTOTEST_MATCH_EXPECTED"] ")$"; exit(ENVIRON["AUTOTEST_MATCH_ACTUAL"] ~ pattern ? 1 : 0) }' ;;
     contains) AUTOTEST_MATCH_ACTUAL="$actual" AUTOTEST_MATCH_EXPECTED="$expected" awk 'BEGIN { exit(ENVIRON["AUTOTEST_MATCH_ACTUAL"] ~ ENVIRON["AUTOTEST_MATCH_EXPECTED"] ? 0 : 1) }' ;;
+    not_contains) AUTOTEST_MATCH_ACTUAL="$actual" AUTOTEST_MATCH_EXPECTED="$expected" awk 'BEGIN { exit(ENVIRON["AUTOTEST_MATCH_ACTUAL"] ~ ENVIRON["AUTOTEST_MATCH_EXPECTED"] ? 1 : 0) }' ;;
     empty) [ -z "$actual" ] ;;
     not_empty) [ -n "$actual" ] ;;
     *) return 1 ;;
@@ -97,11 +99,15 @@ test_build() {
 test_match_value() {
   match_value exact "active" "active" &&
   match_value contains "service active" "active" &&
+  match_value not_exact "inactive" "active" &&
+  match_value not_contains "service stopped" "active" &&
   match_value exact "12345" '[[:digit:]]+' &&
   match_value exact $'one\ntwo' $'one\ntwo' &&
   match_value exact $'one\ntwo' $'^one\ntwo$' &&
   match_value contains "abc123def" '[[:digit:]]+' &&
   ! match_value exact "abc123def" '[[:digit:]]+' &&
+  ! match_value not_exact "active" "active" &&
+  ! match_value not_contains "service active" "active" &&
   ! match_value exact $'/a/b/c/d : protected\n/i/j : protected' '(/[[:alpha:]]+)+ : protected' &&
   ! match_value exact $'one\ntwo' $'^one\ntwo\nthree$' &&
   match_value empty "" "" &&
@@ -346,7 +352,11 @@ test_check_directive_source() {
   grep -Fq "@check <var> <match> <<'EOF'" "$SRC" &&
   grep -Fq '@check <var> <match> <expected>' "$SRC" &&
   grep -Fq 'exact: regex full match' "$SRC" &&
+  grep -Fq 'not_exact: regex must not full match' "$SRC" &&
   grep -Fq 'contains: regex search' "$SRC" &&
+  grep -Fq 'not_contains: regex must not match' "$SRC" &&
+  grep -Fq 'not_exact) AUTOTEST_MATCH_ACTUAL' "$SRC" &&
+  grep -Fq 'not_contains) AUTOTEST_MATCH_ACTUAL' "$SRC" &&
   ! grep -Fq 'MAX_CHECKS' "$SRC" &&
   ! grep -Fq 'Variable match' "$SRC" &&
   ! grep -Fq 'checks: %d/%d' "$SRC" &&
@@ -423,6 +433,16 @@ test_editor_source() {
   grep -Fq 'strcmp(app->editor_command, "q!")' "$SRC" &&
   grep -Fq 'E37: No write since last change (add ! to override)' "$SRC" &&
   grep -Fq 'set_editor_written_status' "$SRC" &&
+  grep -Fq 'editor_try_tab_completion' "$SRC" &&
+  grep -Fq 'editor_build_completion' "$SRC" &&
+  grep -Fq 'completion_common_prefix' "$SRC" &&
+  grep -Fq 'editor_complete_tui_block' "$SRC" &&
+  grep -Fq 'completion_open' "$SRC" &&
+  grep -Fq 'editor_seen_tui_before_current' "$SRC" &&
+  grep -Fq 'AUTOTEST_TUI_STDOUT_FILE' "$SRC" &&
+  grep -Fq 'cursor_y + 1' "$SRC" &&
+  grep -Fq 'draw_completion_window(app, height, width, first_row)' "$SRC" &&
+  grep -Fq 'vim-write-quit' "$SRC" &&
   grep -Fq -- '-- INSERT --' "$SRC" &&
   grep -Fq 'first_row = app->editor_row - rows + 1' "$SRC" &&
   grep -Fq 'line_index = first_row + i' "$SRC" &&
@@ -468,8 +488,12 @@ test_editor_source() {
   grep -Fq 'app->editor_command_mode = false' "$SRC" &&
   grep -Fq 'app->editor_search_mode = false' "$SRC" &&
   grep -Fq 'if (cy <= height - 4' "$SRC" &&
-  grep -Fq 'app->selected_case + app->project.case_count - 1' "$SRC" &&
-  grep -Fq 'app->selected_case = (app->selected_case + 1) % app->project.case_count' "$SRC" &&
+  grep -Fq 'case_filter' "$SRC" &&
+  grep -Fq 'filtered_case_count' "$SRC" &&
+  grep -Fq 'move_filtered_case(app, -1)' "$SRC" &&
+  grep -Fq 'move_filtered_case(app, 1)' "$SRC" &&
+  grep -Fq 'prompt_text("filter tests"' "$SRC" &&
+  grep -Fq '"Filter"' "$SRC" &&
   grep -Fq 'Edit description' "$SRC" &&
   grep -Fq 'EDIT_TARGET_DESCRIPTION' "$SRC" &&
   grep -Fq 'editor_has_unsaved_changes' "$SRC" &&
@@ -529,6 +553,90 @@ int main(void) {
     app.editor_row = 0;
     if (!editor_apply_line_range(&app, 'd')) return 14;
     if (app.editor_line_count != 1 || strcmp(app.editor_lines[0], "four") != 0) return 15;
+    app.editor_target = EDIT_TARGET_COMMAND;
+    load_editor_text(&app, "");
+    app.editor_col = 0;
+    if (editor_try_tab_completion(&app)) return 36;
+    load_editor_text(&app, "@check TEST ");
+    app.editor_col = (int)strlen(app.editor_lines[0]);
+    if (editor_try_tab_completion(&app)) return 37;
+    load_editor_text(&app, "@ch");
+    app.editor_col = 3;
+    if (!editor_try_tab_completion(&app)) return 16;
+    if (strcmp(app.editor_lines[0], "@check ") != 0) return 17;
+    load_editor_text(&app, "  @tu");
+    app.editor_col = (int)strlen(app.editor_lines[0]);
+    if (!editor_try_tab_completion(&app)) return 26;
+    if (app.editor_line_count != 2) return 27;
+    if (strcmp(app.editor_lines[0], "  @tui ") != 0 ||
+        strcmp(app.editor_lines[1], "  @end") != 0) return 28;
+    if (app.editor_row != 0 || app.editor_col != (int)strlen("  @tui ")) return 29;
+    load_editor_text(&app, "@check TEST con");
+    app.editor_col = (int)strlen(app.editor_lines[0]);
+    if (!editor_try_tab_completion(&app)) return 18;
+    if (strcmp(app.editor_lines[0], "@check TEST contains ") != 0) return 19;
+    load_editor_text(&app, "@check TEST not_c");
+    app.editor_col = (int)strlen(app.editor_lines[0]);
+    if (!editor_try_tab_completion(&app)) return 30;
+    if (strcmp(app.editor_lines[0], "@check TEST not_contains ") != 0) return 31;
+    load_editor_text(&app, "@check TEST not_ex");
+    app.editor_col = (int)strlen(app.editor_lines[0]);
+    if (!editor_try_tab_completion(&app)) return 32;
+    if (strcmp(app.editor_lines[0], "@check TEST not_exact ") != 0) return 33;
+    load_editor_text(&app, "@check TEST not_em");
+    app.editor_col = (int)strlen(app.editor_lines[0]);
+    if (!editor_try_tab_completion(&app)) return 34;
+    if (strcmp(app.editor_lines[0], "@check TEST not_empty") != 0) return 35;
+    load_editor_text(&app, "@tui vim\n  sl");
+    app.editor_row = 1;
+    app.editor_col = (int)strlen(app.editor_lines[1]);
+    if (!editor_try_tab_completion(&app)) return 20;
+    if (strcmp(app.editor_lines[1], "  sleep ") != 0) return 21;
+    load_editor_text(&app, "echo foo");
+    app.editor_col = (int)strlen(app.editor_lines[0]);
+    if (editor_try_tab_completion(&app)) return 22;
+    load_editor_text(&app, "@tui vim\n@end\nAUTOTEST_TUI_STDOUT_F");
+    app.editor_row = 2;
+    app.editor_col = (int)strlen(app.editor_lines[2]);
+    if (!editor_try_tab_completion(&app)) return 23;
+    if (strcmp(app.editor_lines[2], "AUTOTEST_TUI_STDOUT_FILE") != 0) return 24;
+    load_editor_text(&app, "@tui vim\n@end\n@check AU exact ok");
+    app.editor_row = 2;
+    app.editor_col = (int)strlen("@check AU");
+    if (!editor_try_tab_completion(&app)) return 38;
+    if (strcmp(app.editor_lines[2], "@check AUTOTEST_TUI_ exact ok") != 0) return 39;
+    load_editor_text(&app, "AUTOTEST_TUI_STDOUT_F");
+    app.editor_col = (int)strlen(app.editor_lines[0]);
+    if (editor_try_tab_completion(&app)) return 25;
+    memset(&app.project, 0, sizeof(app.project));
+    app.project.case_count = 3;
+    copy_text(app.project.cases[0].id, sizeof(app.project.cases[0].id), "TC001");
+    copy_text(app.project.cases[0].title, sizeof(app.project.cases[0].title), "alpha");
+    copy_text(app.project.cases[0].command, sizeof(app.project.cases[0].command), "echo alpha");
+    copy_text(app.project.cases[1].id, sizeof(app.project.cases[1].id), "TC002");
+    copy_text(app.project.cases[1].title, sizeof(app.project.cases[1].title), "beta reboot");
+    copy_text(app.project.cases[1].description, sizeof(app.project.cases[1].description), "rescue flow");
+    copy_text(app.project.cases[2].id, sizeof(app.project.cases[2].id), "TC003");
+    copy_text(app.project.cases[2].title, sizeof(app.project.cases[2].title), "Gamma");
+    copy_text(app.project.cases[2].script_path, sizeof(app.project.cases[2].script_path), "/tmp/gamma.sh");
+    copy_text(app.case_filter, sizeof(app.case_filter), "BETA");
+    app.selected_case = 0;
+    clamp_selected(&app);
+    if (filtered_case_count(&app) != 1 || app.selected_case != 1) return 40;
+    move_filtered_case(&app, 1);
+    if (app.selected_case != 1) return 41;
+    copy_text(app.case_filter, sizeof(app.case_filter), "TC");
+    app.selected_case = 0;
+    move_filtered_case(&app, 1);
+    if (app.selected_case != 1) return 42;
+    move_filtered_case(&app, -1);
+    if (app.selected_case != 0) return 43;
+    copy_text(app.case_filter, sizeof(app.case_filter), "gamma.sh");
+    app.selected_case = 0;
+    clamp_selected(&app);
+    if (filtered_case_count(&app) != 1 || app.selected_case != 2) return 44;
+    copy_text(app.case_filter, sizeof(app.case_filter), "no-such-test");
+    if (filtered_case_count(&app) != 0) return 45;
     return 0;
 }
 EOF

@@ -24,6 +24,7 @@
 #define REGISTRY_LINE (LONG_LEN * 6)
 #define EDITOR_TAB_WIDTH 4
 #define EDITOR_UNDO_DEPTH 32
+#define COMPLETION_MAX 16
 #define LEGACY_REGISTRY_CHECKS 4
 
 typedef enum {
@@ -42,7 +43,9 @@ typedef enum {
 typedef enum {
     MATCH_NONE,
     MATCH_EXACT,
+    MATCH_NOT_EXACT,
     MATCH_CONTAINS,
+    MATCH_NOT_CONTAINS,
     MATCH_EMPTY,
     MATCH_NOT_EMPTY
 } MatchType;
@@ -108,6 +111,7 @@ typedef struct {
     int selected_field;
     int selected_cleanup;
     int selected_preview_file;
+    char case_filter[TEXT_LEN];
     bool selected_only;
     bool run_after_generate;
     ConfirmAction confirm_action;
@@ -125,6 +129,12 @@ typedef struct {
     bool editor_range_pending;
     char editor_range_op;
     int editor_range_anchor;
+    bool completion_open;
+    int completion_count;
+    int completion_selected;
+    int completion_start_col;
+    int completion_end_col;
+    char completion_items[COMPLETION_MAX][TEXT_LEN];
     bool regex_template_list_open;
     bool editor_help_open;
     int editor_help_scroll;
@@ -186,8 +196,10 @@ static const char *EDITOR_HELP_LINES[] = {
     "@check <var> <match> <expected>  Add a variable assertion.",
     "@check <var> <match> <<'EOF'    Use heredoc expected text.",
     "    exact      Regex must match the whole variable value.",
+    "    not_exact  Regex must not match the whole variable value.",
     "    empty      Variable value must be empty.",
     "    contains   Regex must match somewhere in the value.",
+    "    not_contains Regex must not match anywhere in the value.",
     "    not_empty  Variable value must not be empty.",
     "    none       No variable check.",
     "@assert <condition>             Fail immediately when condition is false.",
@@ -229,7 +241,10 @@ static const char *EDITOR_HELP_LINES[] = {
     "Editor normal mode",
     "i insert, :w save, :wq save quit, :q quit, :q! quit without save.",
     "dd / dNd delete lines, yy / yNy copy lines, p / P paste.",
-    "u undo, gg / G / nG jump, /word search, n / N next/previous."
+    "u undo, gg / G / nG jump, /word search, n / N next/previous.",
+    "",
+    "Editor insert mode",
+    "Tab completes custom syntax when available; otherwise inserts a tab."
 };
 
 #define EDITOR_HELP_LINE_COUNT ((int)(sizeof(EDITOR_HELP_LINES) / sizeof(EDITOR_HELP_LINES[0])))
@@ -251,7 +266,9 @@ static const char *match_name(MatchType m) {
     switch (m) {
     case MATCH_NONE: return "none";
     case MATCH_EXACT: return "exact";
+    case MATCH_NOT_EXACT: return "not_exact";
     case MATCH_CONTAINS: return "contains";
+    case MATCH_NOT_CONTAINS: return "not_contains";
     case MATCH_EMPTY: return "empty";
     case MATCH_NOT_EMPTY: return "not_empty";
     }
@@ -305,6 +322,73 @@ static bool has_reboot(const Project *p) {
     return has_reboot_for(p, false);
 }
 
+static int ascii_lower_char(int ch) {
+    return (ch >= 'A' && ch <= 'Z') ? ch + ('a' - 'A') : ch;
+}
+
+static bool text_contains_ascii_ci(const char *haystack, const char *needle) {
+    if (!needle || !needle[0]) return true;
+    if (!haystack) return false;
+    size_t needle_len = strlen(needle);
+    for (const char *p = haystack; *p; p++) {
+        size_t i = 0;
+        while (i < needle_len && p[i] &&
+               ascii_lower_char((unsigned char)p[i]) == ascii_lower_char((unsigned char)needle[i])) {
+            i++;
+        }
+        if (i == needle_len) return true;
+    }
+    return false;
+}
+
+static bool case_matches_filter(const TestCase *tc, const char *filter) {
+    if (!filter || !filter[0]) return true;
+    return text_contains_ascii_ci(tc->id, filter) ||
+           text_contains_ascii_ci(tc->title, filter) ||
+           text_contains_ascii_ci(tc->description, filter) ||
+           text_contains_ascii_ci(tc->script_path, filter) ||
+           text_contains_ascii_ci(tc->command, filter);
+}
+
+static int filtered_case_count(const App *app) {
+    int count = 0;
+    for (int i = 0; i < app->project.case_count; i++) {
+        if (case_matches_filter(&app->project.cases[i], app->case_filter)) count++;
+    }
+    return count;
+}
+
+static int first_filtered_case(const App *app) {
+    for (int i = 0; i < app->project.case_count; i++) {
+        if (case_matches_filter(&app->project.cases[i], app->case_filter)) return i;
+    }
+    return -1;
+}
+
+static void select_first_filtered_case(App *app) {
+    int first = first_filtered_case(app);
+    if (first >= 0) app->selected_case = first;
+}
+
+static void move_filtered_case(App *app, int direction) {
+    int count = filtered_case_count(app);
+    if (count <= 0) return;
+    int current = app->selected_case;
+    if (current < 0 || current >= app->project.case_count ||
+        !case_matches_filter(&app->project.cases[current], app->case_filter)) {
+        select_first_filtered_case(app);
+        return;
+    }
+    for (int step = 1; step <= app->project.case_count; step++) {
+        int next = (current + direction * step) % app->project.case_count;
+        if (next < 0) next += app->project.case_count;
+        if (case_matches_filter(&app->project.cases[next], app->case_filter)) {
+            app->selected_case = next;
+            return;
+        }
+    }
+}
+
 static void clamp_selected(App *app) {
     if (app->project.case_count <= 0) {
         app->selected_case = 0;
@@ -312,6 +396,10 @@ static void clamp_selected(App *app) {
         app->selected_case = app->project.case_count - 1;
     } else if (app->selected_case < 0) {
         app->selected_case = 0;
+    }
+    if (app->project.case_count > 0 && app->case_filter[0] &&
+        !case_matches_filter(&app->project.cases[app->selected_case], app->case_filter)) {
+        select_first_filtered_case(app);
     }
     if (app->selected_cleanup >= app->project.cleanup_count) {
         app->selected_cleanup = app->project.cleanup_count - 1;
@@ -575,6 +663,11 @@ static void load_editor_text(App *app, const char *src) {
     app->editor_range_pending = false;
     app->editor_range_op = '\0';
     app->editor_range_anchor = 0;
+    app->completion_open = false;
+    app->completion_count = 0;
+    app->completion_selected = 0;
+    app->completion_start_col = 0;
+    app->completion_end_col = 0;
     app->editor_command_len = 0;
     app->editor_command[0] = '\0';
     app->editor_normal_command_len = 0;
@@ -706,7 +799,8 @@ static bool editor_uses_regex_templates(const App *app) {
     const TestCase *tc = &app->project.cases[app->selected_case];
     const CheckRule *check = primary_check_const(tc);
     return app->editor_target == EDIT_TARGET_CHECK_EXPECTED && check &&
-           (check->match == MATCH_EXACT || check->match == MATCH_CONTAINS);
+           (check->match == MATCH_EXACT || check->match == MATCH_NOT_EXACT ||
+            check->match == MATCH_CONTAINS || check->match == MATCH_NOT_CONTAINS);
 }
 
 static bool text_contains(const char *haystack, const char *needle) {
@@ -1075,7 +1169,7 @@ static bool validate_check_directive(const char *arg, int line_no, SyntaxError *
         return false;
     }
     if (!is_match_name(match)) {
-        set_syntax_error(err, line_no, "@check match must be exact, contains, empty, not_empty, or none");
+        set_syntax_error(err, line_no, "@check match must be exact, not_exact, contains, not_contains, empty, not_empty, or none");
         return false;
     }
     if (strncmp(expected, "<<", 2) == 0) {
@@ -2067,27 +2161,45 @@ static void draw_menu(int y, int x, int w, const char **items, int count, int se
 }
 
 static void draw_cases(const App *app, int y, int x, int h, int w) {
-    draw_box(y, x, h, w, "Test Cases");
+    char title[TEXT_LEN];
+    int filtered = filtered_case_count(app);
+    if (app->case_filter[0]) {
+        snprintf(title, sizeof(title), "Test Cases filtered:%d/%d", filtered, app->project.case_count);
+    } else {
+        snprintf(title, sizeof(title), "Test Cases");
+    }
+    draw_box(y, x, h, w, title);
     int visible = h - 2;
-    for (int i = 0; i < app->project.case_count && i < visible; i++) {
+    int row = 0;
+    for (int i = 0; i < app->project.case_count && row < visible; i++) {
         const TestCase *tc = &app->project.cases[i];
+        if (!case_matches_filter(tc, app->case_filter)) continue;
         if (i == app->selected_case) attron(A_REVERSE);
-        mvprintw(y + 1 + i, x + 1, "%c %-5s %-22.22s %-7s %s",
+        mvprintw(y + 1 + row, x + 1, "%c %-5s %-22.22s %-7s %s",
                  tc->selected ? '*' : ' ',
                  tc->id,
                  tc->title,
                  command_kind_name(tc->kind),
                  tc->script_path[0] ? "saved" : "not_saved");
         if (i == app->selected_case) attroff(A_REVERSE);
+        row++;
     }
     if (app->project.case_count == 0) {
         mvprintw(y + 1, x + 1, "No test cases. Select Add test case.");
+    } else if (filtered == 0) {
+        mvprintw(y + 1, x + 1, "No matching tests. Clear or change filter.");
     }
 }
 
 static void draw_case_details(const App *app, int y, int x, int h, int w) {
     draw_box(y, x, h, w, "Details");
     if (app->project.case_count == 0) return;
+    if (app->case_filter[0] && filtered_case_count(app) == 0) {
+        int filter_w = w - 31;
+        if (filter_w < 1) filter_w = 1;
+        mvprintw(y + 1, x + 1, "No matching test for filter: %.*s", filter_w, app->case_filter);
+        return;
+    }
     const TestCase *tc = &app->project.cases[app->selected_case];
     int check_count = command_check_count(tc->command);
     int line = y + 1;
@@ -2098,7 +2210,9 @@ static void draw_case_details(const App *app, int y, int x, int h, int w) {
     mvprintw(line++, x + 1, "checks: %d from @check lines", check_count);
     mvprintw(line++, x + 1, "@check <var> <match> <expected>");
     mvprintw(line++, x + 3, "exact: regex full match");
+    mvprintw(line++, x + 3, "not_exact: regex must not full match");
     mvprintw(line++, x + 3, "contains: regex search");
+    mvprintw(line++, x + 3, "not_contains: regex must not match");
     mvprintw(line++, x + 3, "empty: no text  not_empty: any text");
     mvprintw(line++, x + 1, "cleanup: auto %s", tc->cleanup[0] ? "generated" : "none");
     mvprintw(line++, x + 1, "reboot: auto %s", tc->kind == CMD_REBOOT ? "detected" : "none");
@@ -2136,13 +2250,22 @@ static void draw_editor(const App *app, int height, int width) {
     draw_cases(app, top, 0, bottom - top, left_w);
     draw_case_details(app, top, left_w + 1, bottom - top, width - left_w - 1);
     draw_box(bottom, 0, 4, width, "Selection / Warnings");
-    mvprintw(bottom + 1, 1, "shell:bash  final NG exit:1  selected:%d  cleanup/reboot:auto",
-             selected_count(&app->project));
+    if (app->case_filter[0]) {
+        int filter_w = width - 42;
+        if (filter_w < 1) filter_w = 1;
+        mvprintw(bottom + 1, 1, "filter:%.*s  matches:%d/%d  selected:%d",
+                 filter_w, app->case_filter,
+                 filtered_case_count(app), app->project.case_count,
+                 selected_count(&app->project));
+    } else {
+        mvprintw(bottom + 1, 1, "shell:bash  final NG exit:1  selected:%d  cleanup/reboot:auto",
+                 selected_count(&app->project));
+    }
     if (has_reboot(&app->project)) {
         mvprintw(bottom + 2, 1, "selected reboot tests may interrupt sequential execution");
     }
-    static const char *menu[] = {"Edit test", "Edit description", "Rename test", "Copy test", "Select test", "Delete test", "Print script", "Preview selected", "Start selected tests", "Back"};
-    draw_menu(height - 4, 1, width - 2, menu, 10, app->selected_menu);
+    static const char *menu[] = {"Edit test", "Edit description", "Rename test", "Copy test", "Select test", "Delete test", "Print script", "Filter", "Preview selected", "Start selected tests", "Back"};
+    draw_menu(height - 4, 1, width - 2, menu, 11, app->selected_menu);
 }
 
 static void draw_form(const App *app, int height, int width) {
@@ -2186,10 +2309,12 @@ static void draw_match(const App *app, int height, int width) {
     mvprintw(5, 2, "checks: %d from script @check lines", check_count);
     mvprintw(6, 2, "@check <var> <match> <expected>");
     mvprintw(7, 4, "exact      expected regex must match the whole value");
-    mvprintw(8, 4, "contains   expected regex must match somewhere");
-    mvprintw(9, 4, "empty      variable value must be empty");
-    mvprintw(10, 4, "not_empty  variable value must not be empty");
-    mvprintw(12, 4, "none       no variable check");
+    mvprintw(8, 4, "not_exact  expected regex must not match the whole value");
+    mvprintw(9, 4, "contains   expected regex must match somewhere");
+    mvprintw(10, 4, "not_contains expected regex must not match anywhere");
+    mvprintw(11, 4, "empty      variable value must be empty");
+    mvprintw(12, 4, "not_empty  variable value must not be empty");
+    mvprintw(14, 4, "none       no variable check");
     static const char *menu[] = {"Back"};
     draw_menu(height - 4, 1, width - 2, menu, 1, app->selected_menu);
 }
@@ -2263,6 +2388,50 @@ static void draw_editor_help(const App *app, int height, int width) {
     }
 }
 
+static void draw_completion_window(const App *app, int height, int width, int first_row) {
+    if (!app->completion_open || app->completion_count <= 0) return;
+    int rows = app->completion_count;
+    if (rows > 8) rows = 8;
+    int box_h = rows + 2;
+    int box_w = 24;
+    for (int i = 0; i < app->completion_count && i < rows; i++) {
+        int item_w = editor_visual_col(app->completion_items[i], (int)strlen(app->completion_items[i])) + 4;
+        if (item_w > box_w) box_w = item_w;
+    }
+    if (box_w > 48) box_w = 48;
+    if (box_w > width - 2) box_w = width - 2;
+    if (box_h > height - 6) box_h = height - 6;
+    if (box_w < 12 || box_h < 3) return;
+
+    int cursor_y = 6 + app->editor_row - first_row;
+    int cursor_x = 7 + editor_visual_col(app->editor_lines[app->editor_row], app->editor_col);
+    int y = cursor_y + 1;
+    int x = cursor_x;
+    if (y + box_h > height - 4) y = cursor_y - box_h;
+    if (y < 4) y = 4;
+    if (x + box_w > width - 1) x = width - box_w - 1;
+    if (x < 1) x = 1;
+
+    for (int row = 0; row < box_h; row++) {
+        mvhline(y + row, x, ' ', box_w);
+    }
+    for (int i = 0; i < app->completion_count && i < rows; i++) {
+        if (i == app->completion_selected) attron(A_REVERSE);
+        print_clip(y + 1 + i, x + 1, box_w - 2, app->completion_items[i]);
+        if (i == app->completion_selected) attroff(A_REVERSE);
+    }
+    mvaddch(y, x, ACS_ULCORNER);
+    mvhline(y, x + 1, ACS_HLINE, box_w - 2);
+    mvaddch(y, x + box_w - 1, ACS_URCORNER);
+    for (int row = 1; row < box_h - 1; row++) {
+        mvaddch(y + row, x, ACS_VLINE);
+        mvaddch(y + row, x + box_w - 1, ACS_VLINE);
+    }
+    mvaddch(y + box_h - 1, x, ACS_LLCORNER);
+    mvhline(y + box_h - 1, x + 1, ACS_HLINE, box_w - 2);
+    mvaddch(y + box_h - 1, x + box_w - 1, ACS_LRCORNER);
+}
+
 static void draw_script_editor(const App *app, int height, int width) {
     draw_header(app, width);
     char title[TEXT_LEN];
@@ -2321,6 +2490,9 @@ static void draw_script_editor(const App *app, int height, int width) {
     }
     if (app->editor_help_open) {
         draw_editor_help(app, height, width);
+    }
+    if (app->completion_open) {
+        draw_completion_window(app, height, width, first_row);
     }
     if (app->editor_insert) {
         int cy = 6 + app->editor_row - first_row;
@@ -2595,7 +2767,7 @@ static int prompt_int(const char *label, int current) {
 }
 
 static void cycle_match(MatchType *m) {
-    *m = (MatchType)((*m + 1) % 5);
+    *m = (MatchType)((*m + 1) % (MATCH_NOT_EMPTY + 1));
 }
 
 static void cycle_kind(TestCase *tc) {
@@ -2744,6 +2916,266 @@ static void editor_insert_text(App *app, const char *text) {
     for (size_t i = 0; text && text[i]; i++) {
         editor_insert_char(app, (unsigned char)text[i]);
     }
+}
+
+static const char *skip_spaces_const(const char *s) {
+    while (s && (*s == ' ' || *s == '\t')) s++;
+    return s ? s : "";
+}
+
+static bool token_equals(const char *s, const char *token) {
+    s = skip_spaces_const(s);
+    size_t len = strlen(token);
+    return strncmp(s, token, len) == 0 &&
+           (s[len] == '\0' || isspace((unsigned char)s[len]));
+}
+
+static int editor_current_token_start(const App *app) {
+    const char *line = app->editor_lines[app->editor_row];
+    int col = app->editor_col;
+    int len = (int)strlen(line);
+    if (col > len) col = len;
+    while (col > 0 && !isspace((unsigned char)line[col - 1])) col--;
+    return col;
+}
+
+static int editor_token_index_before_col(const char *line, int col) {
+    int index = 0;
+    bool in_token = false;
+    for (int i = 0; line && line[i] && i < col; i++) {
+        if (isspace((unsigned char)line[i])) {
+            in_token = false;
+        } else if (!in_token) {
+            index++;
+            in_token = true;
+        }
+    }
+    return index;
+}
+
+static void editor_current_prefix(const App *app, int start_col, char *dst, size_t dst_sz) {
+    const char *line = app->editor_lines[app->editor_row];
+    int col = app->editor_col;
+    int len = (int)strlen(line);
+    if (col > len) col = len;
+    if (start_col < 0) start_col = 0;
+    if (start_col > col) start_col = col;
+    size_t n = (size_t)(col - start_col);
+    if (n >= dst_sz) n = dst_sz - 1;
+    memcpy(dst, line + start_col, n);
+    dst[n] = '\0';
+}
+
+static bool editor_inside_tui_block(const App *app) {
+    bool inside = false;
+    for (int r = 0; r < app->editor_row; r++) {
+        const char *line = skip_spaces_const(app->editor_lines[r]);
+        if (token_equals(line, "@tui")) inside = true;
+        else if (token_equals(line, "@end")) inside = false;
+    }
+    if (inside && token_equals(app->editor_lines[app->editor_row], "@end")) return false;
+    return inside;
+}
+
+static bool editor_seen_tui_before_current(const App *app) {
+    for (int r = 0; r < app->editor_row; r++) {
+        if (token_equals(app->editor_lines[r], "@tui")) return true;
+    }
+    return false;
+}
+
+static void completion_reset(App *app) {
+    app->completion_open = false;
+    app->completion_count = 0;
+    app->completion_selected = 0;
+    app->completion_start_col = 0;
+    app->completion_end_col = 0;
+}
+
+static void completion_add(App *app, const char *item, const char *prefix) {
+    if (app->completion_count >= COMPLETION_MAX) return;
+    if (prefix && prefix[0] && strncmp(item, prefix, strlen(prefix)) != 0) return;
+    copy_text(app->completion_items[app->completion_count], TEXT_LEN, item);
+    app->completion_count++;
+}
+
+static bool editor_build_completion(App *app) {
+    static const char *directives[] = {
+        "@check ", "@assert ", "@backup ", "@restore ", "@tui ", "@reboot-if "
+    };
+    static const char *tui_commands[] = {
+        "send ", "text ", "enter", "esc", "tab", "space", "sleep ", "ctrl ",
+        "vim-clear", "vim-write-quit"
+    };
+    static const char *check_matches[] = {
+        "exact ", "not_exact ", "contains ", "not_contains ", "empty", "not_empty"
+    };
+    static const char *tui_vars[] = {
+        "AUTOTEST_TUI_STDOUT", "AUTOTEST_TUI_TEXT", "AUTOTEST_TUI_TRANSCRIPT",
+        "AUTOTEST_TUI_STDERR", "AUTOTEST_TUI_STATUS", "AUTOTEST_TUI_STDOUT_FILE",
+        "AUTOTEST_TUI_TEXT_FILE", "AUTOTEST_TUI_TRANSCRIPT_FILE",
+        "AUTOTEST_TUI_INPUT_FILE", "AUTOTEST_TUI_STDERR_FILE"
+    };
+
+    completion_reset(app);
+    if (app->editor_target != EDIT_TARGET_COMMAND) return false;
+
+    const char *line = app->editor_lines[app->editor_row];
+    int start_col = editor_current_token_start(app);
+    int token_index = editor_token_index_before_col(line, start_col);
+    char prefix[TEXT_LEN];
+    editor_current_prefix(app, start_col, prefix, sizeof(prefix));
+    if (prefix[0] == '\0') return false;
+
+    app->completion_start_col = start_col;
+    app->completion_end_col = app->editor_col;
+
+    if (token_equals(line, "@check") && token_index == 2) {
+        for (size_t i = 0; i < sizeof(check_matches) / sizeof(check_matches[0]); i++) {
+            completion_add(app, check_matches[i], prefix);
+        }
+    } else if (editor_inside_tui_block(app)) {
+        for (size_t i = 0; i < sizeof(tui_commands) / sizeof(tui_commands[0]); i++) {
+            completion_add(app, tui_commands[i], prefix);
+        }
+    } else if (editor_seen_tui_before_current(app) && prefix[0] &&
+               (strncmp(prefix, "AUTOTEST_TUI_", strlen("AUTOTEST_TUI_")) == 0 ||
+                strncmp("AUTOTEST_TUI_", prefix, strlen(prefix)) == 0)) {
+        for (size_t i = 0; i < sizeof(tui_vars) / sizeof(tui_vars[0]); i++) {
+            completion_add(app, tui_vars[i], prefix);
+        }
+    } else {
+        bool only_indent_before_token = true;
+        for (int i = 0; line[i] && i < start_col; i++) {
+            if (line[i] != ' ' && line[i] != '\t') {
+                only_indent_before_token = false;
+                break;
+            }
+        }
+        if (!only_indent_before_token && prefix[0] != '@') return false;
+        for (size_t i = 0; i < sizeof(directives) / sizeof(directives[0]); i++) {
+            completion_add(app, directives[i], prefix);
+        }
+    }
+
+    return app->completion_count > 0;
+}
+
+static void editor_replace_range(App *app, int start_col, int end_col, const char *text) {
+    char *line = app->editor_lines[app->editor_row];
+    int len = (int)strlen(line);
+    if (start_col < 0) start_col = 0;
+    if (end_col < start_col) end_col = start_col;
+    if (end_col > len) end_col = len;
+    int text_len = (int)strlen(text);
+    if (len - (end_col - start_col) + text_len >= EDITOR_COLS) {
+        set_status(app, "Completion would exceed line limit.");
+        return;
+    }
+    editor_save_undo(app);
+    memmove(line + start_col + text_len, line + end_col, (size_t)(len - end_col + 1));
+    memcpy(line + start_col, text, (size_t)text_len);
+    app->editor_col = start_col + text_len;
+    editor_update_desired_col(app);
+}
+
+static void editor_complete_tui_block(App *app, int start_col, int end_col) {
+    if (app->editor_line_count >= EDITOR_LINES) {
+        editor_replace_range(app, start_col, end_col, "@tui ");
+        return;
+    }
+
+    char *line = app->editor_lines[app->editor_row];
+    int len = (int)strlen(line);
+    if (start_col < 0) start_col = 0;
+    if (end_col < start_col) end_col = start_col;
+    if (end_col > len) end_col = len;
+
+    const char *text = "@tui ";
+    int text_len = (int)strlen(text);
+    if (len - (end_col - start_col) + text_len >= EDITOR_COLS) {
+        set_status(app, "Completion would exceed line limit.");
+        return;
+    }
+
+    char end_line[EDITOR_COLS];
+    int indent_len = 0;
+    while ((line[indent_len] == ' ' || line[indent_len] == '\t') &&
+           indent_len < EDITOR_COLS - 5) {
+        end_line[indent_len] = line[indent_len];
+        indent_len++;
+    }
+    memcpy(end_line + indent_len, "@end", 5);
+
+    editor_save_undo(app);
+    memmove(line + start_col + text_len, line + end_col, (size_t)(len - end_col + 1));
+    memcpy(line + start_col, text, (size_t)text_len);
+
+    for (int r = app->editor_line_count; r > app->editor_row + 1; r--) {
+        copy_text(app->editor_lines[r], EDITOR_COLS, app->editor_lines[r - 1]);
+    }
+    copy_text(app->editor_lines[app->editor_row + 1], EDITOR_COLS, end_line);
+    app->editor_line_count++;
+    app->editor_col = start_col + text_len;
+    editor_update_desired_col(app);
+    set_status(app, "Completed @tui block.");
+}
+
+static void editor_accept_completion(App *app) {
+    if (app->completion_count <= 0) return;
+    if (app->completion_selected < 0) app->completion_selected = 0;
+    if (app->completion_selected >= app->completion_count) app->completion_selected = app->completion_count - 1;
+    char item[TEXT_LEN];
+    copy_text(item, sizeof(item), app->completion_items[app->completion_selected]);
+    int start_col = app->completion_start_col;
+    int end_col = app->completion_end_col;
+    completion_reset(app);
+    if (strcmp(item, "@tui ") == 0) {
+        editor_complete_tui_block(app, start_col, end_col);
+    } else {
+        editor_replace_range(app, start_col, end_col, item);
+        set_status(app, "Completed.");
+    }
+}
+
+static bool completion_common_prefix(const App *app, char *out, size_t out_sz) {
+    if (out_sz == 0 || app->completion_count <= 1) return false;
+    copy_text(out, out_sz, app->completion_items[0]);
+    for (int i = 1; i < app->completion_count; i++) {
+        size_t j = 0;
+        while (out[j] && app->completion_items[i][j] &&
+               out[j] == app->completion_items[i][j] &&
+               j + 1 < out_sz) {
+            j++;
+        }
+        out[j] = '\0';
+    }
+    return out[0] != '\0';
+}
+
+static bool editor_try_tab_completion(App *app) {
+    if (!editor_build_completion(app)) return false;
+    if (app->completion_count == 1) {
+        app->completion_selected = 0;
+        editor_accept_completion(app);
+    } else {
+        char common[TEXT_LEN];
+        if (completion_common_prefix(app, common, sizeof(common))) {
+            int typed_len = app->completion_end_col - app->completion_start_col;
+            if ((int)strlen(common) > typed_len) {
+                int start_col = app->completion_start_col;
+                int end_col = app->completion_end_col;
+                completion_reset(app);
+                editor_replace_range(app, start_col, end_col, common);
+                set_status(app, "Completed common prefix.");
+                return true;
+            }
+        }
+        app->completion_open = true;
+        app->completion_selected = 0;
+        set_status(app, "Completion opened.");
+    }
+    return true;
 }
 
 static void editor_newline(App *app) {
@@ -3090,6 +3522,31 @@ static bool editor_handle_escape_sequence(App *app) {
 
 static void handle_script_editor_key(App *app, int ch) {
     if (app->editor_insert) {
+        bool completion_handled = false;
+        if (app->completion_open) {
+            if (ch == '\t' || ch == KEY_DOWN) {
+                app->completion_selected = (app->completion_selected + 1) % app->completion_count;
+                completion_handled = true;
+            } else if (ch == KEY_UP || ch == KEY_BTAB) {
+                app->completion_selected--;
+                if (app->completion_selected < 0) app->completion_selected = app->completion_count - 1;
+                completion_handled = true;
+            } else if (ch == '\n' || ch == KEY_ENTER) {
+                editor_accept_completion(app);
+                completion_handled = true;
+            } else if (ch == 27) {
+                completion_reset(app);
+                set_status(app, "Closed completion.");
+                completion_handled = true;
+            } else {
+                completion_reset(app);
+            }
+        }
+        if (completion_handled) {
+            editor_ensure_cursor_visible(app, editor_visible_rows(app, LINES));
+            return;
+        }
+
         if (ch == 27) {
             if (!editor_handle_escape_sequence(app)) {
                 app->editor_insert = false;
@@ -3119,7 +3576,9 @@ static void handle_script_editor_key(App *app, int ch) {
         } else if (ch == KEY_DOWN && app->editor_row + 1 < app->editor_line_count) {
             editor_move_vertical(app, 1);
         } else if (ch == '\t') {
-            editor_insert_char(app, '\t');
+            if (!editor_try_tab_completion(app)) {
+                editor_insert_char(app, '\t');
+            }
         } else if (editor_is_text_char(ch)) {
             editor_insert_wchar(app, (wint_t)ch);
         }
@@ -3561,7 +4020,9 @@ static void write_match_function(FILE *f) {
     fputs("  case \"$type\" in\n", f);
     fputs("    none) return 0 ;;\n", f);
     fputs("    exact) AUTOTEST_MATCH_ACTUAL=\"$actual\" AUTOTEST_MATCH_EXPECTED=\"$expected\" awk 'BEGIN { pattern = \"^(\" ENVIRON[\"AUTOTEST_MATCH_EXPECTED\"] \")$\"; exit(ENVIRON[\"AUTOTEST_MATCH_ACTUAL\"] ~ pattern ? 0 : 1) }' ;;\n", f);
+    fputs("    not_exact) AUTOTEST_MATCH_ACTUAL=\"$actual\" AUTOTEST_MATCH_EXPECTED=\"$expected\" awk 'BEGIN { pattern = \"^(\" ENVIRON[\"AUTOTEST_MATCH_EXPECTED\"] \")$\"; exit(ENVIRON[\"AUTOTEST_MATCH_ACTUAL\"] ~ pattern ? 1 : 0) }' ;;\n", f);
     fputs("    contains) AUTOTEST_MATCH_ACTUAL=\"$actual\" AUTOTEST_MATCH_EXPECTED=\"$expected\" awk 'BEGIN { exit(ENVIRON[\"AUTOTEST_MATCH_ACTUAL\"] ~ ENVIRON[\"AUTOTEST_MATCH_EXPECTED\"] ? 0 : 1) }' ;;\n", f);
+    fputs("    not_contains) AUTOTEST_MATCH_ACTUAL=\"$actual\" AUTOTEST_MATCH_EXPECTED=\"$expected\" awk 'BEGIN { exit(ENVIRON[\"AUTOTEST_MATCH_ACTUAL\"] ~ ENVIRON[\"AUTOTEST_MATCH_EXPECTED\"] ? 1 : 0) }' ;;\n", f);
     fputs("    empty) [ -z \"$actual\" ] ;;\n", f);
     fputs("    not_empty) [ -n \"$actual\" ] ;;\n", f);
     fputs("    *) return 1 ;;\n", f);
@@ -4311,6 +4772,25 @@ static void start_selected_test_scripts(App *app) {
     refresh();
 }
 
+static void edit_case_filter(App *app) {
+    char buf[TEXT_LEN];
+    copy_text(buf, sizeof(buf), app->case_filter);
+    if (!prompt_text("filter tests", buf, sizeof(buf))) {
+        set_status(app, "Filter unchanged.");
+        return;
+    }
+    copy_text(app->case_filter, sizeof(app->case_filter), buf);
+    clamp_selected(app);
+    if (!app->case_filter[0]) {
+        set_status(app, "Filter cleared.");
+    } else if (filtered_case_count(app) == 0) {
+        set_status(app, "Filter applied. No matching tests.");
+    } else {
+        select_first_filtered_case(app);
+        set_status(app, "Filter applied.");
+    }
+}
+
 static void run_selected_menu(App *app) {
     switch (app->screen) {
     case SCREEN_DASHBOARD:
@@ -4323,21 +4803,25 @@ static void run_selected_menu(App *app) {
         }
         else set_status(app, "Use menu items with Enter. Esc exits.");
         break;
-    case SCREEN_EDITOR:
-        if (app->selected_menu == 0 && app->project.case_count) { app->editor_new_case = false; open_script_editor(app); }
-        else if (app->selected_menu == 1 && app->project.case_count) open_text_editor(app, EDIT_TARGET_DESCRIPTION, SCREEN_EDITOR);
-        else if (app->selected_menu == 2 && app->project.case_count) rename_case(app);
-        else if (app->selected_menu == 3 && app->project.case_count) copy_case(app);
-        else if (app->selected_menu == 4 && app->project.case_count) { app->project.cases[app->selected_case].selected = !app->project.cases[app->selected_case].selected; save_test_registry(&app->project); }
-        else if (app->selected_menu == 5 && app->project.case_count) { app->confirm_action = CONFIRM_DELETE; app->previous_screen = app->screen; app->screen = SCREEN_CONFIRM; app->selected_menu = 0; }
-        else if (app->selected_menu == 6 && app->project.case_count) print_current_test_script(app);
-        else if (app->selected_menu == 7) { app->selected_only = true; preview_script(app); app->screen = SCREEN_PREVIEW; app->selected_menu = 0; }
-        else if (app->selected_menu == 8) {
+    case SCREEN_EDITOR: {
+        bool has_visible_case = app->project.case_count > 0 && filtered_case_count(app) > 0;
+        if (app->selected_menu == 0 && has_visible_case) { app->editor_new_case = false; open_script_editor(app); }
+        else if (app->selected_menu == 1 && has_visible_case) open_text_editor(app, EDIT_TARGET_DESCRIPTION, SCREEN_EDITOR);
+        else if (app->selected_menu == 2 && has_visible_case) rename_case(app);
+        else if (app->selected_menu == 3 && has_visible_case) copy_case(app);
+        else if (app->selected_menu == 4 && has_visible_case) { app->project.cases[app->selected_case].selected = !app->project.cases[app->selected_case].selected; save_test_registry(&app->project); }
+        else if (app->selected_menu == 5 && has_visible_case) { app->confirm_action = CONFIRM_DELETE; app->previous_screen = app->screen; app->screen = SCREEN_CONFIRM; app->selected_menu = 0; }
+        else if (app->selected_menu == 6 && has_visible_case) print_current_test_script(app);
+        else if (app->selected_menu == 7) edit_case_filter(app);
+        else if (app->selected_menu == 8) { app->selected_only = true; preview_script(app); app->screen = SCREEN_PREVIEW; app->selected_menu = 0; }
+        else if (app->selected_menu == 9) {
             if (selected_count(&app->project) == 0) set_status(app, "Select at least one test before starting.");
             else { app->selected_only = true; app->run_after_generate = true; app->confirm_action = CONFIRM_GENERATE; app->previous_screen = app->screen; app->screen = SCREEN_CONFIRM; app->selected_menu = 0; }
         }
-        else if (app->selected_menu == 9) { app->screen = SCREEN_DASHBOARD; app->selected_menu = 0; }
+        else if (app->selected_menu == 10) { app->screen = SCREEN_DASHBOARD; app->selected_menu = 0; }
+        else if (!has_visible_case && app->selected_menu <= 6) set_status(app, "No visible test for current filter.");
         break;
+    }
     case SCREEN_FORM:
         if (app->selected_menu == 0 || app->selected_menu == 1) edit_selected_field(app);
         else if (app->selected_menu == 2 && app->project.case_count) { app->project.cases[app->selected_case].kind = CMD_SHELL; prompt_text("shell command", app->project.cases[app->selected_case].command, sizeof(app->project.cases[app->selected_case].command)); }
@@ -4436,7 +4920,7 @@ static void run_selected_menu(App *app) {
 static int menu_count_for(Screen s) {
     switch (s) {
     case SCREEN_DASHBOARD: return 5;
-    case SCREEN_EDITOR: return 10;
+    case SCREEN_EDITOR: return 11;
     case SCREEN_FORM: return 7;
     case SCREEN_MATCH: return 1;
     case SCREEN_CLEANUP: return 6;
@@ -4458,7 +4942,7 @@ static void handle_key(App *app, int ch) {
     switch (ch) {
     case KEY_UP:
         if (app->screen == SCREEN_EDITOR && app->project.case_count > 0) {
-            app->selected_case = (app->selected_case + app->project.case_count - 1) % app->project.case_count;
+            move_filtered_case(app, -1);
         }
         else if (app->screen == SCREEN_FORM) app->selected_field--;
         else if (app->screen == SCREEN_CLEANUP) app->selected_cleanup--;
@@ -4466,7 +4950,7 @@ static void handle_key(App *app, int ch) {
         break;
     case KEY_DOWN:
         if (app->screen == SCREEN_EDITOR && app->project.case_count > 0) {
-            app->selected_case = (app->selected_case + 1) % app->project.case_count;
+            move_filtered_case(app, 1);
         }
         else if (app->screen == SCREEN_FORM) app->selected_field++;
         else if (app->screen == SCREEN_CLEANUP) app->selected_cleanup++;
@@ -4482,6 +4966,9 @@ static void handle_key(App *app, int ch) {
     case '\n':
     case KEY_ENTER:
         run_selected_menu(app);
+        break;
+    case '/':
+        if (app->screen == SCREEN_EDITOR) edit_case_filter(app);
         break;
     case 27:
         set_status(app, "Esc exits the TUI from any non-editor screen.");

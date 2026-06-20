@@ -55,9 +55,11 @@ count=12
 All `@check` lines must pass for the test to be OK. There is no fixed four-check
 limit; the builder scans every `@check` line in the script body.
 In the built-in script editor, use `:template` to open regex templates and
-insert common patterns while writing `@check` rules. `exact` and `contains` both
-accept extended regular expressions. `exact` must match the entire variable
-value; `contains` succeeds when the expression matches somewhere in the value.
+insert common patterns while writing `@check` rules. `exact`, `not_exact`,
+`contains`, and `not_contains` all accept extended regular expressions.
+`exact` must match the entire variable value; `not_exact` succeeds when it does
+not. `contains` succeeds when the expression matches somewhere in the value;
+`not_contains` succeeds when it does not match anywhere.
 Multi-line patterns are matched as one multi-line pattern, not as independent
 line patterns. Legacy `regex` rules are read as `exact`.
 
@@ -505,7 +507,7 @@ run_test() {
 - プロジェクト一覧
 - テストケース新規作成
 - command, expected_exit, stdout/stderr 判定の編集
-- 判定方式: exact, contains, empty, not_empty
+- 判定方式: exact, not_exact, contains, not_contains, empty, not_empty
 - cleanup の編集
 - reboot フェーズの選択
 - Bash スクリプト生成
@@ -542,8 +544,9 @@ apt-get install -y build-essential libncurses-dev
 - `Create test` 後にvim風の独自エディタを開く
 - エディタ操作: `i` で入力、`Esc` でノーマル、`:wq` で保存、`:q` で破棄
 - テストケースの追加/編集/削除
+- テスト一覧の絞り込み: `Filter` または `/` で入力、空にすると解除
 - `expected_exit` の設定
-- stdout/stderr の `none`, `exact`, `contains`, `empty`, `not_empty`
+- stdout/stderr の `none`, `exact`, `not_exact`, `contains`, `not_contains`, `empty`, `not_empty`
 - 再起動前/後フェーズの設定
 - cleanup コマンドの設定
 - Bash スクリプトプレビュー
