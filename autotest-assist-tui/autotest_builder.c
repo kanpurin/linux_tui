@@ -20,8 +20,7 @@
 #define LONG_LEN 4096
 #define PREVIEW_LINES 512
 #define EDITOR_LINES 160
-#define EDITOR_COLS 256
-#define REGISTRY_LINE (LONG_LEN * 6)
+#define EDITOR_LINE_INITIAL_CAP 128
 #define EDITOR_TAB_WIDTH 4
 #define EDITOR_UNDO_DEPTH 32
 #define COMPLETION_MAX 16
@@ -82,7 +81,7 @@ typedef struct {
     char id[32];
     char title[TEXT_LEN];
     char description[LONG_LEN];
-    char command[LONG_LEN];
+    char *command;
     char script_path[LONG_LEN];
     CommandKind kind;
     bool selected;
@@ -115,12 +114,14 @@ typedef struct {
     bool selected_only;
     bool run_after_generate;
     ConfirmAction confirm_action;
-    char editor_lines[EDITOR_LINES][EDITOR_COLS];
+    char *editor_lines[EDITOR_LINES];
+    size_t editor_line_caps[EDITOR_LINES];
     int editor_line_count;
     int editor_row;
     int editor_col;
     int editor_desired_col;
     int editor_first_row;
+    int editor_first_wrap_row;
     bool editor_insert;
     bool editor_command_mode;
     bool editor_search_mode;
@@ -145,9 +146,9 @@ typedef struct {
     int editor_command_len;
     char editor_search[TEXT_LEN];
     int editor_search_len;
-    char editor_clipboard[EDITOR_LINES][EDITOR_COLS];
+    char *editor_clipboard[EDITOR_LINES];
     int editor_clipboard_count;
-    char editor_undo_lines[EDITOR_UNDO_DEPTH][EDITOR_LINES][EDITOR_COLS];
+    char *editor_undo_lines[EDITOR_UNDO_DEPTH][EDITOR_LINES];
     int editor_undo_line_count[EDITOR_UNDO_DEPTH];
     int editor_undo_row[EDITOR_UNDO_DEPTH];
     int editor_undo_col[EDITOR_UNDO_DEPTH];
@@ -256,6 +257,8 @@ static void shell_quote_buf(char *dst, size_t dst_sz, const char *src);
 static void write_comment_block(FILE *f, const char *label, const char *text);
 static void auto_configure_test(TestCase *tc);
 static void save_test_registry(const Project *p);
+static const char *test_command(const TestCase *tc);
+static bool set_test_command(TestCase *tc, const char *command);
 static bool command_looks_like_reboot(const char *cmd);
 static void trim_line_copy(char *dst, size_t dst_sz, const char *line, size_t len);
 static void copy_text(char *dst, size_t dst_sz, const char *src);
@@ -347,7 +350,7 @@ static bool case_matches_filter(const TestCase *tc, const char *filter) {
            text_contains_ascii_ci(tc->title, filter) ||
            text_contains_ascii_ci(tc->description, filter) ||
            text_contains_ascii_ci(tc->script_path, filter) ||
-           text_contains_ascii_ci(tc->command, filter);
+           text_contains_ascii_ci(test_command(tc), filter);
 }
 
 static int filtered_case_count(const App *app) {
@@ -529,9 +532,55 @@ static void print_editor_line(int y, int x, int w, const char *line) {
     }
 }
 
-static void draw_editor_cursor(const App *app, int y, int x, int w, const char *line) {
+static void print_editor_line_segment(int y, int x, int w, const char *line, int start_visual) {
+    int cx = x;
+    int visual = 0;
+    if (start_visual < 0) start_visual = 0;
+    for (int i = 0; line && line[i] && cx < x + w;) {
+        int len = utf8_char_len_at(line, i);
+        int char_w = utf8_char_width_at(line, i);
+        int next_visual = visual + char_w;
+        if (next_visual <= start_visual) {
+            visual = next_visual;
+            i += len;
+            continue;
+        }
+        if (line[i] == '\t') {
+            int first_space = start_visual > visual ? start_visual - visual : 0;
+            for (int n = first_space; n < EDITOR_TAB_WIDTH && cx < x + w; n++) {
+                mvaddch(y, cx++, ' ');
+            }
+        } else {
+            if (cx + char_w > x + w) break;
+            mvaddnstr(y, cx, line + i, len);
+            cx += char_w;
+        }
+        visual = next_visual;
+        i += len;
+    }
+    while (cx < x + w) {
+        mvaddch(y, cx++, ' ');
+    }
+}
+
+static int editor_wrapped_rows_for_line(const App *app, int line_index, int wrap_w) {
+    if (wrap_w < 1) wrap_w = 1;
+    const char *line = app->editor_lines[line_index];
+    int visual = editor_visual_col(line, (int)strlen(line));
+    int rows = visual > 0 ? (visual + wrap_w - 1) / wrap_w : 1;
+    if (line_index == app->editor_row) {
+        int cursor_visual = editor_visual_col(line, app->editor_col);
+        int cursor_row = cursor_visual / wrap_w;
+        if (rows <= cursor_row) rows = cursor_row + 1;
+    }
+    return rows < 1 ? 1 : rows;
+}
+
+static void draw_editor_cursor(const App *app, int y, int x, int w, const char *line, int start_visual) {
     int len = (int)strlen(line);
-    int cx = x + editor_visual_col(line, app->editor_col);
+    int rel = editor_visual_col(line, app->editor_col) - start_visual;
+    if (rel < 0 || rel >= w) return;
+    int cx = x + rel;
     if (cx >= x + w) return;
     attron(A_UNDERLINE);
     if (app->editor_col < len) {
@@ -549,27 +598,6 @@ static void draw_editor_cursor(const App *app, int y, int x, int w, const char *
     attroff(A_UNDERLINE);
 }
 
-static void escape_field(char *dst, size_t dst_sz, const char *src) {
-    size_t j = 0;
-    if (dst_sz == 0) return;
-    for (size_t i = 0; src && src[i] && j + 2 < dst_sz; i++) {
-        unsigned char c = (unsigned char)src[i];
-        if (c == '\n') {
-            dst[j++] = '\\';
-            dst[j++] = 'n';
-        } else if (c == '\t') {
-            dst[j++] = '\\';
-            dst[j++] = 't';
-        } else if (c == '\\') {
-            dst[j++] = '\\';
-            dst[j++] = '\\';
-        } else {
-            dst[j++] = (char)c;
-        }
-    }
-    dst[j] = '\0';
-}
-
 static void unescape_field(char *dst, size_t dst_sz, const char *src) {
     size_t j = 0;
     if (dst_sz == 0) return;
@@ -584,6 +612,73 @@ static void unescape_field(char *dst, size_t dst_sz, const char *src) {
         }
     }
     dst[j] = '\0';
+}
+
+static char *unescape_field_alloc(const char *src) {
+    size_t cap = 128;
+    size_t j = 0;
+    char *dst = malloc(cap);
+    if (!dst) return NULL;
+    for (size_t i = 0; src && src[i]; i++) {
+        char ch = src[i];
+        if (ch == '\\' && src[i + 1]) {
+            i++;
+            if (src[i] == 'n') ch = '\n';
+            else if (src[i] == 't') ch = '\t';
+            else ch = src[i];
+        }
+        if (j + 1 >= cap) {
+            size_t next_cap = cap * 2;
+            char *grown = realloc(dst, next_cap);
+            if (!grown) {
+                free(dst);
+                return NULL;
+            }
+            dst = grown;
+            cap = next_cap;
+        }
+        dst[j++] = ch;
+    }
+    dst[j] = '\0';
+    return dst;
+}
+
+static void write_escaped_field(FILE *f, const char *src) {
+    for (size_t i = 0; src && src[i]; i++) {
+        unsigned char c = (unsigned char)src[i];
+        if (c == '\n') fputs("\\n", f);
+        else if (c == '\t') fputs("\\t", f);
+        else if (c == '\\') fputs("\\\\", f);
+        else fputc((char)c, f);
+    }
+}
+
+static char *read_line_alloc(FILE *f) {
+    size_t cap = 1024;
+    size_t len = 0;
+    char *line = malloc(cap);
+    if (!line) return NULL;
+    int ch;
+    while ((ch = fgetc(f)) != EOF) {
+        if (len + 1 >= cap) {
+            size_t next_cap = cap * 2;
+            char *grown = realloc(line, next_cap);
+            if (!grown) {
+                free(line);
+                return NULL;
+            }
+            line = grown;
+            cap = next_cap;
+        }
+        line[len++] = (char)ch;
+        if (ch == '\n') break;
+    }
+    if (len == 0 && ch == EOF) {
+        free(line);
+        return NULL;
+    }
+    line[len] = '\0';
+    return line;
 }
 
 static MatchType parse_match(const char *s) {
@@ -650,12 +745,149 @@ static const char *editor_target_name(EditorTarget target) {
     return "text";
 }
 
+static char *dup_text_heap(const char *src) {
+    if (!src) src = "";
+    size_t len = strlen(src);
+    char *out = malloc(len + 1);
+    if (!out) return NULL;
+    memcpy(out, src, len + 1);
+    return out;
+}
+
+static const char *test_command(const TestCase *tc) {
+    return (tc && tc->command) ? tc->command : "";
+}
+
+static bool set_test_command(TestCase *tc, const char *command) {
+    char *copy = dup_text_heap(command);
+    if (!copy) return false;
+    free(tc->command);
+    tc->command = copy;
+    return true;
+}
+
+static bool take_test_command(TestCase *tc, char *command) {
+    if (!command) return set_test_command(tc, "");
+    free(tc->command);
+    tc->command = command;
+    return true;
+}
+
+static void free_test_case(TestCase *tc) {
+    if (!tc) return;
+    free(tc->command);
+    tc->command = NULL;
+}
+
+static bool editor_ensure_line_capacity(App *app, int row, size_t content_len) {
+    if (row < 0 || row >= EDITOR_LINES) return false;
+    size_t needed = content_len + 1;
+    if (needed < EDITOR_LINE_INITIAL_CAP) needed = EDITOR_LINE_INITIAL_CAP;
+    if (app->editor_lines[row] && app->editor_line_caps[row] >= needed) return true;
+
+    size_t cap = app->editor_line_caps[row] ? app->editor_line_caps[row] : EDITOR_LINE_INITIAL_CAP;
+    while (cap < needed) {
+        if (cap > ((size_t)-1) / 2) {
+            cap = needed;
+            break;
+        }
+        cap *= 2;
+    }
+    char *grown = realloc(app->editor_lines[row], cap);
+    if (!grown) {
+        set_status(app, "Out of memory.");
+        return false;
+    }
+    if (!app->editor_lines[row]) grown[0] = '\0';
+    app->editor_lines[row] = grown;
+    app->editor_line_caps[row] = cap;
+    return true;
+}
+
+static bool editor_set_line(App *app, int row, const char *text) {
+    if (!text) text = "";
+    size_t len = strlen(text);
+    if (!editor_ensure_line_capacity(app, row, len)) return false;
+    memcpy(app->editor_lines[row], text, len + 1);
+    return true;
+}
+
+static void editor_clear_line(App *app, int row) {
+    if (editor_ensure_line_capacity(app, row, 0)) app->editor_lines[row][0] = '\0';
+}
+
+static void editor_free_line(App *app, int row) {
+    if (row < 0 || row >= EDITOR_LINES) return;
+    free(app->editor_lines[row]);
+    app->editor_lines[row] = NULL;
+    app->editor_line_caps[row] = 0;
+}
+
+static void editor_free_clipboard(App *app) {
+    for (int i = 0; i < EDITOR_LINES; i++) {
+        free(app->editor_clipboard[i]);
+        app->editor_clipboard[i] = NULL;
+    }
+    app->editor_clipboard_count = 0;
+}
+
+static bool editor_set_clipboard_line(App *app, int index, const char *text) {
+    if (index < 0 || index >= EDITOR_LINES) return false;
+    char *copy = dup_text_heap(text);
+    if (!copy) {
+        set_status(app, "Out of memory.");
+        return false;
+    }
+    free(app->editor_clipboard[index]);
+    app->editor_clipboard[index] = copy;
+    return true;
+}
+
+static void editor_free_undo_slot(App *app, int slot) {
+    if (slot < 0 || slot >= EDITOR_UNDO_DEPTH) return;
+    for (int r = 0; r < EDITOR_LINES; r++) {
+        free(app->editor_undo_lines[slot][r]);
+        app->editor_undo_lines[slot][r] = NULL;
+    }
+}
+
+static void editor_clear_undo(App *app) {
+    for (int i = 0; i < EDITOR_UNDO_DEPTH; i++) editor_free_undo_slot(app, i);
+    app->editor_undo_count = 0;
+}
+
+static void editor_free_all_lines(App *app) {
+    for (int r = 0; r < EDITOR_LINES; r++) editor_free_line(app, r);
+}
+
+static bool editor_insert_empty_line(App *app, int at) {
+    if (app->editor_line_count >= EDITOR_LINES) {
+        set_status(app, "Editor line limit reached.");
+        return false;
+    }
+    if (at < 0) at = 0;
+    if (at > app->editor_line_count) at = app->editor_line_count;
+    for (int r = app->editor_line_count; r > at; r--) {
+        app->editor_lines[r] = app->editor_lines[r - 1];
+        app->editor_line_caps[r] = app->editor_line_caps[r - 1];
+    }
+    app->editor_lines[at] = NULL;
+    app->editor_line_caps[at] = 0;
+    app->editor_line_count++;
+    return editor_set_line(app, at, "");
+}
+
 static void load_editor_text(App *app, const char *src) {
+    editor_clear_undo(app);
+    editor_free_clipboard(app);
+    editor_free_all_lines(app);
+
     app->editor_line_count = 1;
     app->editor_row = 0;
     app->editor_col = 0;
     app->editor_desired_col = 0;
     app->editor_first_row = 0;
+    app->editor_first_wrap_row = 0;
     app->editor_insert = false;
     app->editor_command_mode = false;
     app->editor_search_mode = false;
@@ -674,29 +906,27 @@ static void load_editor_text(App *app, const char *src) {
     app->editor_normal_command[0] = '\0';
     app->editor_search_len = 0;
     app->editor_search[0] = '\0';
-    app->editor_clipboard_count = 0;
-    app->editor_undo_count = 0;
-    memset(app->editor_lines, 0, sizeof(app->editor_lines));
 
     int row = 0;
-    int col = 0;
-    for (size_t i = 0; src[i] && row < EDITOR_LINES; i++) {
-        if (src[i] == '\n') {
-            app->editor_lines[row][col] = '\0';
+    const char *start = src ? src : "";
+    for (const char *p = start; row < EDITOR_LINES; p++) {
+        if (*p == '\n' || *p == '\0') {
+            size_t len = (size_t)(p - start);
+            if (!editor_ensure_line_capacity(app, row, len)) {
+                app->editor_line_count = row + 1;
+                break;
+            }
+            memcpy(app->editor_lines[row], start, len);
+            app->editor_lines[row][len] = '\0';
+            app->editor_line_count = row + 1;
+            if (*p == '\0') break;
             row++;
-            col = 0;
-            if (row >= EDITOR_LINES) break;
-            continue;
-        }
-        if (col + 1 < EDITOR_COLS) {
-            app->editor_lines[row][col++] = src[i];
+            start = p + 1;
         }
     }
-    if (row < EDITOR_LINES) {
-        app->editor_lines[row][col] = '\0';
-        app->editor_line_count = row + 1;
-    } else {
-        app->editor_line_count = EDITOR_LINES;
+    if (app->editor_line_count < 1) {
+        app->editor_line_count = 1;
+        editor_clear_line(app, 0);
     }
 }
 
@@ -705,7 +935,7 @@ static void save_editor_text(App *app, char *dst, size_t dst_sz) {
     if (dst_sz == 0) return;
     dst[0] = '\0';
     for (int r = 0; r < app->editor_line_count; r++) {
-        const char *line = app->editor_lines[r];
+        const char *line = app->editor_lines[r] ? app->editor_lines[r] : "";
         size_t len = strlen(line);
         if (pos + len + 2 >= dst_sz) break;
         memcpy(dst + pos, line, len);
@@ -715,6 +945,26 @@ static void save_editor_text(App *app, char *dst, size_t dst_sz) {
     dst[pos] = '\0';
 }
 
+static char *editor_text_alloc(const App *app) {
+    size_t total = 1;
+    for (int r = 0; r < app->editor_line_count; r++) {
+        total += strlen(app->editor_lines[r] ? app->editor_lines[r] : "");
+        if (r + 1 < app->editor_line_count) total++;
+    }
+    char *out = malloc(total);
+    if (!out) return NULL;
+    size_t pos = 0;
+    for (int r = 0; r < app->editor_line_count; r++) {
+        const char *line = app->editor_lines[r] ? app->editor_lines[r] : "";
+        size_t len = strlen(line);
+        memcpy(out + pos, line, len);
+        pos += len;
+        if (r + 1 < app->editor_line_count) out[pos++] = '\n';
+    }
+    out[pos] = '\0';
+    return out;
+}
+
 static int editor_visible_rows(const App *app, int height) {
     int rows = height - 9;
     if (app->editor_command_mode || app->editor_search_mode) rows = height - 10;
@@ -722,20 +972,86 @@ static int editor_visible_rows(const App *app, int height) {
     return rows;
 }
 
+static int editor_total_screen_rows(const App *app, int wrap_w) {
+    int total = 0;
+    if (wrap_w < 1) wrap_w = 1;
+    for (int r = 0; r < app->editor_line_count; r++) {
+        total += editor_wrapped_rows_for_line(app, r, wrap_w);
+    }
+    return total < 1 ? 1 : total;
+}
+
+static int editor_line_screen_start(const App *app, int line_index, int wrap_w) {
+    int row = 0;
+    if (wrap_w < 1) wrap_w = 1;
+    if (line_index < 0) return 0;
+    if (line_index > app->editor_line_count) line_index = app->editor_line_count;
+    for (int r = 0; r < line_index; r++) {
+        row += editor_wrapped_rows_for_line(app, r, wrap_w);
+    }
+    return row;
+}
+
+static int editor_scroll_screen_row(const App *app, int wrap_w) {
+    int row = editor_line_screen_start(app, app->editor_first_row, wrap_w);
+    int wrapped = editor_wrapped_rows_for_line(app, app->editor_first_row, wrap_w);
+    int first_wrap = app->editor_first_wrap_row;
+    if (first_wrap < 0) first_wrap = 0;
+    if (first_wrap >= wrapped) first_wrap = wrapped - 1;
+    return row + first_wrap;
+}
+
+static int editor_cursor_screen_row_abs(const App *app, int wrap_w) {
+    if (wrap_w < 1) wrap_w = 1;
+    return editor_line_screen_start(app, app->editor_row, wrap_w) +
+           editor_visual_col(app->editor_lines[app->editor_row], app->editor_col) / wrap_w;
+}
+
+static void editor_set_scroll_screen_row(App *app, int scroll, int rows, int wrap_w) {
+    if (wrap_w < 1) wrap_w = 1;
+    int total = editor_total_screen_rows(app, wrap_w);
+    int max_scroll = total > rows ? total - rows : 0;
+    if (scroll < 0) scroll = 0;
+    if (scroll > max_scroll) scroll = max_scroll;
+
+    int acc = 0;
+    for (int r = 0; r < app->editor_line_count; r++) {
+        int wrapped = editor_wrapped_rows_for_line(app, r, wrap_w);
+        if (scroll < acc + wrapped) {
+            app->editor_first_row = r;
+            app->editor_first_wrap_row = scroll - acc;
+            return;
+        }
+        acc += wrapped;
+    }
+    app->editor_first_row = app->editor_line_count > 0 ? app->editor_line_count - 1 : 0;
+    app->editor_first_wrap_row = 0;
+}
+
 static void editor_clamp_scroll(App *app, int rows) {
-    int max_first = app->editor_line_count > rows ? app->editor_line_count - rows : 0;
-    if (app->editor_first_row < 0) app->editor_first_row = 0;
-    if (app->editor_first_row > max_first) app->editor_first_row = max_first;
+    int wrap_w = COLS - 9;
+    if (wrap_w < 1) wrap_w = 1;
+    editor_set_scroll_screen_row(app, editor_scroll_screen_row(app, wrap_w), rows, wrap_w);
+}
+
+static int editor_cursor_screen_row_from_first(const App *app, int first_row, int wrap_w) {
+    int scroll = editor_line_screen_start(app, first_row, wrap_w);
+    if (first_row == app->editor_first_row) scroll += app->editor_first_wrap_row;
+    return editor_cursor_screen_row_abs(app, wrap_w) - scroll;
 }
 
 static void editor_ensure_cursor_visible(App *app, int rows) {
+    int wrap_w = COLS - 9;
+    if (wrap_w < 1) wrap_w = 1;
     editor_clamp_scroll(app, rows);
-    if (app->editor_row < app->editor_first_row) {
-        app->editor_first_row = app->editor_row;
-    } else if (app->editor_row >= app->editor_first_row + rows) {
-        app->editor_first_row = app->editor_row - rows + 1;
+    int scroll = editor_scroll_screen_row(app, wrap_w);
+    int cursor = editor_cursor_screen_row_abs(app, wrap_w);
+    if (cursor < scroll) {
+        scroll = cursor;
+    } else if (cursor >= scroll + rows) {
+        scroll = cursor - rows + 1;
     }
-    editor_clamp_scroll(app, rows);
+    editor_set_scroll_screen_row(app, scroll, rows, wrap_w);
 }
 
 static void print_raw_script_text(const char *text) {
@@ -756,14 +1072,18 @@ static void print_current_test_script(App *app) {
         set_status(app, "No test script to print.");
         return;
     }
-    print_raw_script_text(app->project.cases[app->selected_case].command);
+    print_raw_script_text(test_command(&app->project.cases[app->selected_case]));
     set_status(app, "Printed script to stdout.");
 }
 
 static void print_editor_script(App *app) {
-    char buf[LONG_LEN];
-    save_editor_text(app, buf, sizeof(buf));
+    char *buf = editor_text_alloc(app);
+    if (!buf) {
+        set_status(app, "Out of memory.");
+        return;
+    }
     print_raw_script_text(buf);
+    free(buf);
     set_status(app, "Printed editor script to stdout.");
 }
 
@@ -771,7 +1091,7 @@ static void load_editor_from_case(App *app) {
     if (app->project.case_count == 0) return;
     const TestCase *tc = &app->project.cases[app->selected_case];
     const CheckRule *check = primary_check_const(tc);
-    const char *src = tc->command;
+    const char *src = test_command(tc);
     if (app->editor_target == EDIT_TARGET_CHECK_EXPECTED && check) src = check->expected;
     if (app->editor_target == EDIT_TARGET_DESCRIPTION) src = tc->description;
     load_editor_text(app, src);
@@ -786,7 +1106,12 @@ static void save_editor_to_case(App *app) {
     } else if (app->editor_target == EDIT_TARGET_DESCRIPTION) {
         save_editor_text(app, tc->description, sizeof(tc->description));
     } else {
-        save_editor_text(app, tc->command, sizeof(tc->command));
+        char *command = editor_text_alloc(app);
+        if (!command) {
+            set_status(app, "Out of memory.");
+            return;
+        }
+        take_test_command(tc, command);
         tc->kind = CMD_SHELL;
         auto_configure_test(tc);
     }
@@ -1470,7 +1795,7 @@ static void append_cleanup_path(TestCase *tc, const char *path) {
 }
 
 static void collect_temp_paths(TestCase *tc, const char *prefix) {
-    const char *p = tc->command;
+    const char *p = test_command(tc);
     size_t prefix_len = strlen(prefix);
     while ((p = strstr(p, prefix)) != NULL) {
         char path[TEXT_LEN];
@@ -1570,7 +1895,7 @@ static void collect_check_heredoc(const char *body_start, const char *delim, cha
 static void collect_check_directives(TestCase *tc) {
     int count = 0;
     bool stored_first = false;
-    const char *p = tc->command;
+    const char *p = test_command(tc);
     memset(tc->checks, 0, sizeof(tc->checks));
     while (p && *p) {
         const char *end = strchr(p, '\n');
@@ -1634,7 +1959,7 @@ static int command_check_count(const char *command) {
 
 static bool legacy_primary_check_enabled(const TestCase *tc) {
     return tc &&
-           command_check_count(tc->command) == 0 &&
+           command_check_count(test_command(tc)) == 0 &&
            tc->check_count > 0 &&
            tc->checks[0].var[0] &&
            tc->checks[0].match != MATCH_NONE;
@@ -1655,8 +1980,8 @@ static void auto_configure_test(TestCase *tc) {
     tc->cleanup[0] = '\0';
     collect_temp_paths(tc, "/tmp/");
     collect_temp_paths(tc, "/var/tmp/");
-    if (!tc->command[0]) return;
-    if (command_looks_like_reboot(tc->command)) {
+    if (!test_command(tc)[0]) return;
+    if (command_looks_like_reboot(test_command(tc))) {
         tc->kind = CMD_REBOOT;
     } else if (tc->kind == CMD_REBOOT) {
         tc->kind = CMD_SHELL;
@@ -1821,10 +2146,12 @@ static void discard_current_case_if_new(App *app) {
     if (!app->editor_new_case || app->project.case_count == 0) return;
     int idx = app->selected_case;
     if (idx < 0 || idx >= app->project.case_count) return;
+    free_test_case(&app->project.cases[idx]);
     for (int i = idx; i < app->project.case_count - 1; i++) {
         app->project.cases[i] = app->project.cases[i + 1];
     }
     app->project.case_count--;
+    if (app->project.case_count >= 0) memset(&app->project.cases[app->project.case_count], 0, sizeof(app->project.cases[app->project.case_count]));
     app->editor_new_case = false;
     clamp_selected(app);
 }
@@ -1850,10 +2177,14 @@ static void set_editor_written_status(App *app, const char *name) {
 
 static bool save_current_editor(App *app, bool exit_after_save) {
     if (app->editor_target == EDIT_TARGET_COMMAND) {
-        char candidate[LONG_LEN];
+        char *candidate = editor_text_alloc(app);
         SyntaxError err;
-        save_editor_text(app, candidate, sizeof(candidate));
+        if (!candidate) {
+            set_status(app, "Out of memory.");
+            return false;
+        }
         if (!validate_script_syntax(candidate, &err)) {
+            free(candidate);
             if (err.line_no > 0) {
                 snprintf(app->status, sizeof(app->status),
                          "Syntax error line %d: %s", err.line_no, err.message);
@@ -1863,6 +2194,7 @@ static bool save_current_editor(App *app, bool exit_after_save) {
             }
             return false;
         }
+        free(candidate);
     }
 
     save_editor_to_case(app);
@@ -1954,25 +2286,24 @@ static void save_test_registry(const Project *p) {
     for (int i = 0; i < p->case_count; i++) {
         const TestCase *tc = &p->cases[i];
         if (!tc->script_path[0]) continue;
-        char fields[6 + LEGACY_REGISTRY_CHECKS * 3 + 2][LONG_LEN];
-        escape_field(fields[0], sizeof(fields[0]), tc->script_path);
-        escape_field(fields[1], sizeof(fields[1]), tc->title);
-        snprintf(fields[2], sizeof(fields[2]), "%d", tc->selected ? 1 : 0);
-        escape_field(fields[3], sizeof(fields[3]), command_kind_name(tc->kind));
-        snprintf(fields[4], sizeof(fields[4]), "%d", tc->expected_exit);
-        snprintf(fields[5], sizeof(fields[5]), "%d", tc->check_count);
+        write_escaped_field(f, tc->script_path);
+        fputc('\t', f);
+        write_escaped_field(f, tc->title);
+        fprintf(f, "\t%d\t", tc->selected ? 1 : 0);
+        write_escaped_field(f, command_kind_name(tc->kind));
+        fprintf(f, "\t%d\t%d", tc->expected_exit, tc->check_count);
         for (int c = 0; c < LEGACY_REGISTRY_CHECKS; c++) {
-            int base = 6 + c * 3;
-            escape_field(fields[base], sizeof(fields[base]), tc->checks[c].var);
-            escape_field(fields[base + 1], sizeof(fields[base + 1]), match_name(tc->checks[c].match));
-            escape_field(fields[base + 2], sizeof(fields[base + 2]), tc->checks[c].expected);
+            fputc('\t', f);
+            write_escaped_field(f, tc->checks[c].var);
+            fputc('\t', f);
+            write_escaped_field(f, match_name(tc->checks[c].match));
+            fputc('\t', f);
+            write_escaped_field(f, tc->checks[c].expected);
         }
-        escape_field(fields[6 + LEGACY_REGISTRY_CHECKS * 3], sizeof(fields[6 + LEGACY_REGISTRY_CHECKS * 3]), tc->command);
-        escape_field(fields[6 + LEGACY_REGISTRY_CHECKS * 3 + 1], sizeof(fields[6 + LEGACY_REGISTRY_CHECKS * 3 + 1]), tc->description);
-        for (int c = 0; c < 6 + LEGACY_REGISTRY_CHECKS * 3 + 2; c++) {
-            if (c) fputc('\t', f);
-            fputs(fields[c], f);
-        }
+        fputc('\t', f);
+        write_escaped_field(f, test_command(tc));
+        fputc('\t', f);
+        write_escaped_field(f, tc->description);
         fputc('\n', f);
     }
     fclose(f);
@@ -1980,14 +2311,18 @@ static void save_test_registry(const Project *p) {
 
 static bool load_test_registry(Project *p) {
     char path[LONG_LEN];
-    char line[REGISTRY_LINE];
     if (registry_path(path, sizeof(path)) != 0) return false;
     FILE *f = fopen(path, "r");
     if (!f) return false;
 
     p->case_count = 0;
-    while (fgets(line, sizeof(line), f) && p->case_count < MAX_CASES) {
-        if (line[0] == '#' || line[0] == '\n' || line[0] == '\0') continue;
+    char *line = NULL;
+    while ((line = read_line_alloc(f)) && p->case_count < MAX_CASES) {
+        if (line[0] == '#' || line[0] == '\n' || line[0] == '\0') {
+            free(line);
+            line = NULL;
+            continue;
+        }
         line[strcspn(line, "\r\n")] = '\0';
         char *fields[25] = {0};
         int field_count = 0;
@@ -1999,7 +2334,11 @@ static bool load_test_registry(Project *p) {
             *tab = '\0';
             cursor = tab + 1;
         }
-        if (field_count < 2 || !fields[0][0]) continue;
+        if (field_count < 2 || !fields[0][0]) {
+            free(line);
+            line = NULL;
+            continue;
+        }
 
         TestCase *tc = &p->cases[p->case_count];
         memset(tc, 0, sizeof(*tc));
@@ -2023,22 +2362,23 @@ static bool load_test_registry(Project *p) {
                 unescape_field(tc->checks[c].expected, sizeof(tc->checks[c].expected), fields[base + 2]);
             }
             if (!tc->checks[0].var[0]) copy_text(tc->checks[0].var, sizeof(tc->checks[0].var), "AUTOTEST_ACTUAL");
-            unescape_field(tc->command, sizeof(tc->command), fields[18]);
+            take_test_command(tc, unescape_field_alloc(fields[18]));
             if (field_count > 19) unescape_field(tc->description, sizeof(tc->description), fields[19]);
         } else if (field_count > 7 && is_match_name(fields[5]) && is_match_name(fields[7])) {
             tc->checks[0].match = parse_match(fields[5]);
             if (field_count > 6) unescape_field(tc->checks[0].expected, sizeof(tc->checks[0].expected), fields[6]);
-            if (field_count > 9) unescape_field(tc->command, sizeof(tc->command), fields[9]);
+            if (field_count > 9) take_test_command(tc, unescape_field_alloc(fields[9]));
         } else {
             if (field_count > 5) unescape_field(tc->checks[0].var, sizeof(tc->checks[0].var), fields[5]);
             if (!tc->checks[0].var[0]) copy_text(tc->checks[0].var, sizeof(tc->checks[0].var), "AUTOTEST_ACTUAL");
             tc->checks[0].match = field_count > 6 ? parse_match(fields[6]) : MATCH_NONE;
             if (field_count > 7) unescape_field(tc->checks[0].expected, sizeof(tc->checks[0].expected), fields[7]);
-            if (field_count > 8) unescape_field(tc->command, sizeof(tc->command), fields[8]);
+            if (field_count > 8) take_test_command(tc, unescape_field_alloc(fields[8]));
         }
+        if (!tc->command) set_test_command(tc, "");
         tc->timeout_sec = 30;
         if (!tc->title[0]) copy_text(tc->title, sizeof(tc->title), tc->script_path);
-        if (command_check_count(tc->command) > 0) {
+        if (command_check_count(test_command(tc)) > 0) {
             collect_check_directives(tc);
         } else if (tc->checks[0].match == MATCH_NONE) {
             tc->check_count = 0;
@@ -2046,7 +2386,10 @@ static bool load_test_registry(Project *p) {
         }
         if (tc->kind != CMD_REBOOT && file_contains_reboot(tc->script_path)) tc->kind = CMD_REBOOT;
         p->case_count++;
+        free(line);
+        line = NULL;
     }
+    free(line);
     fclose(f);
     return p->case_count > 0;
 }
@@ -2201,7 +2544,7 @@ static void draw_case_details(const App *app, int y, int x, int h, int w) {
         return;
     }
     const TestCase *tc = &app->project.cases[app->selected_case];
-    int check_count = command_check_count(tc->command);
+    int check_count = command_check_count(test_command(tc));
     int line = y + 1;
     mvprintw(line++, x + 1, "id: %s", tc->id);
     mvprintw(line++, x + 1, "title: %.*s", w - 9, tc->title);
@@ -2280,7 +2623,7 @@ static void draw_form(const App *app, int height, int width) {
     snprintf(values[1], sizeof(values[1]), "%s", tc->title);
     snprintf(values[2], sizeof(values[2]), "%s", tc->selected ? "yes" : "no");
     snprintf(values[3], sizeof(values[3]), "%s", command_kind_name(tc->kind));
-    snprintf(values[4], sizeof(values[4]), "%s", tc->command);
+    snprintf(values[4], sizeof(values[4]), "%s", test_command(tc));
     snprintf(values[5], sizeof(values[5]), "%d", tc->expected_exit);
     snprintf(values[6], sizeof(values[6]), "%s", check ? check->var : "AUTOTEST_ACTUAL");
     snprintf(values[7], sizeof(values[7]), "%s", match_name(check ? check->match : MATCH_NONE));
@@ -2305,7 +2648,7 @@ static void draw_match(const App *app, int height, int width) {
     draw_box(3, 0, height - 7, width, "@check Reference");
     if (app->project.case_count == 0) return;
     const TestCase *tc = &app->project.cases[app->selected_case];
-    int check_count = command_check_count(tc->command);
+    int check_count = command_check_count(test_command(tc));
     mvprintw(5, 2, "checks: %d from script @check lines", check_count);
     mvprintw(6, 2, "@check <var> <match> <expected>");
     mvprintw(7, 4, "exact      expected regex must match the whole value");
@@ -2403,8 +2746,11 @@ static void draw_completion_window(const App *app, int height, int width, int fi
     if (box_h > height - 6) box_h = height - 6;
     if (box_w < 12 || box_h < 3) return;
 
-    int cursor_y = 6 + app->editor_row - first_row;
-    int cursor_x = 7 + editor_visual_col(app->editor_lines[app->editor_row], app->editor_col);
+    int wrap_w = width - 9;
+    if (wrap_w < 1) wrap_w = 1;
+    int cursor_visual = editor_visual_col(app->editor_lines[app->editor_row], app->editor_col);
+    int cursor_y = 6 + editor_cursor_screen_row_from_first(app, first_row, wrap_w);
+    int cursor_x = 7 + (cursor_visual % wrap_w);
     int y = cursor_y + 1;
     int x = cursor_x;
     if (y + box_h > height - 4) y = cursor_y - box_h;
@@ -2443,18 +2789,37 @@ static void draw_script_editor(const App *app, int height, int width) {
     }
     bool regex_templates = editor_uses_regex_templates(app);
     int rows = editor_visible_rows(app, height);
+    int wrap_w = width - 9;
+    if (wrap_w < 1) wrap_w = 1;
     int first_row = app->editor_first_row;
-    int max_first = app->editor_line_count > rows ? app->editor_line_count - rows : 0;
     if (first_row < 0) first_row = 0;
-    if (first_row > max_first) first_row = max_first;
-    for (int i = 0; i < rows && first_row + i < app->editor_line_count; i++) {
-        int line_index = first_row + i;
-        int y = 6 + i;
-        mvprintw(y, 2, "%3d ", line_index + 1);
-        print_editor_line(y, 7, width - 9, app->editor_lines[line_index]);
-        if (line_index == app->editor_row) {
-            draw_editor_cursor(app, y, 7, width - 9, app->editor_lines[line_index]);
+    if (first_row >= app->editor_line_count) first_row = app->editor_line_count - 1;
+    int first_wrap = app->editor_first_wrap_row;
+    int screen_row = 0;
+    for (int line_index = first_row; line_index < app->editor_line_count && screen_row < rows; line_index++) {
+        int wrapped_rows = editor_wrapped_rows_for_line(app, line_index, wrap_w);
+        int start_wrap = line_index == first_row ? first_wrap : 0;
+        if (start_wrap < 0) start_wrap = 0;
+        if (start_wrap >= wrapped_rows) start_wrap = wrapped_rows - 1;
+        for (int wrap_row = start_wrap; wrap_row < wrapped_rows && screen_row < rows; wrap_row++) {
+            int y = 6 + screen_row;
+            if (wrap_row == 0) {
+                mvprintw(y, 2, "%3d ", line_index + 1);
+            } else {
+                mvprintw(y, 2, "    ");
+            }
+            int start_visual = wrap_row * wrap_w;
+            print_editor_line_segment(y, 7, wrap_w, app->editor_lines[line_index], start_visual);
+            if (line_index == app->editor_row) {
+                draw_editor_cursor(app, y, 7, wrap_w, app->editor_lines[line_index], start_visual);
+            }
+            screen_row++;
         }
+    }
+    while (screen_row < rows) {
+        int y = 6 + screen_row;
+        mvhline(y, 1, ' ', width - 2);
+        screen_row++;
     }
     if (app->editor_insert) {
         mvhline(height - 4, 1, ' ', width - 2);
@@ -2495,9 +2860,10 @@ static void draw_script_editor(const App *app, int height, int width) {
         draw_completion_window(app, height, width, first_row);
     }
     if (app->editor_insert) {
-        int cy = 6 + app->editor_row - first_row;
-        int cx = 7 + editor_visual_col(app->editor_lines[app->editor_row], app->editor_col);
-        if (cy <= height - 4 && cx < width - 1) move(cy, cx);
+        int cy = 6 + editor_cursor_screen_row_from_first(app, first_row, wrap_w);
+        int cursor_visual = editor_visual_col(app->editor_lines[app->editor_row], app->editor_col);
+        int cx = 7 + (cursor_visual % wrap_w);
+        if (cy >= 6 && cy <= height - 4 && cx < width - 1) move(cy, cx);
     }
 }
 
@@ -2558,7 +2924,7 @@ static void preview_script(App *app) {
             preview_add(app, "  # install a one-shot systemd resume unit, then run reboot command");
             preview_add(app, "  # after boot: run post phase, verify result, cleanup");
         } else {
-            snprintf(line, sizeof(line), "  bash -c '%s' >\"$WORK_DIR/case_%03d.stdout\" 2>\"$WORK_DIR/case_%03d.stderr\"", tc->command, i + 1, i + 1);
+            snprintf(line, sizeof(line), "  bash -c '%s' >\"$WORK_DIR/case_%03d.stdout\" 2>\"$WORK_DIR/case_%03d.stderr\"", test_command(tc), i + 1, i + 1);
             preview_add(app, line);
             preview_add(app, "  actual_exit=$?");
             snprintf(line, sizeof(line), "  # OK when actual_exit == %d and variable check passes", tc->expected_exit);
@@ -2800,7 +3166,7 @@ static void set_reboot_command(TestCase *tc) {
     tc->expected_exit = 0;
     tc->check_count = 0;
     memset(tc->checks, 0, sizeof(tc->checks));
-    copy_text(tc->command, sizeof(tc->command), "__AUTOTEST_REBOOT__");
+    set_test_command(tc, "__AUTOTEST_REBOOT__");
 }
 
 static void set_vim_command(TestCase *tc) {
@@ -2812,9 +3178,11 @@ static void set_vim_command(TestCase *tc) {
     char qtext[TEXT_LEN * 2];
     quote_for_printf(qpath, sizeof(qpath), path);
     quote_for_printf(qtext, sizeof(qtext), text);
-    snprintf(tc->command, sizeof(tc->command),
+    char command[LONG_LEN];
+    snprintf(command, sizeof(command),
              "{ sleep 0.3; printf 'gg'; printf 'dG'; printf 'i'; printf '%s\\n'; printf '\\033'; printf ':wq\\r'; } | script -q -c \"vim -Nu NONE -n '%s'\" /dev/null >/dev/null 2>&1",
              qtext, qpath);
+    set_test_command(tc, command);
     tc->kind = CMD_VIM;
     tc->expected_exit = 0;
     tc->check_count = 0;
@@ -2824,14 +3192,25 @@ static void set_vim_command(TestCase *tc) {
 static void editor_save_undo(App *app) {
     app->editor_dirty = true;
     if (app->editor_undo_count >= EDITOR_UNDO_DEPTH) {
+        editor_free_undo_slot(app, 0);
         memmove(app->editor_undo_lines, app->editor_undo_lines + 1, sizeof(app->editor_undo_lines[0]) * (EDITOR_UNDO_DEPTH - 1));
         memmove(app->editor_undo_line_count, app->editor_undo_line_count + 1, sizeof(app->editor_undo_line_count[0]) * (EDITOR_UNDO_DEPTH - 1));
         memmove(app->editor_undo_row, app->editor_undo_row + 1, sizeof(app->editor_undo_row[0]) * (EDITOR_UNDO_DEPTH - 1));
         memmove(app->editor_undo_col, app->editor_undo_col + 1, sizeof(app->editor_undo_col[0]) * (EDITOR_UNDO_DEPTH - 1));
+        memset(app->editor_undo_lines[EDITOR_UNDO_DEPTH - 1], 0, sizeof(app->editor_undo_lines[EDITOR_UNDO_DEPTH - 1]));
         app->editor_undo_count = EDITOR_UNDO_DEPTH - 1;
     }
     int slot = app->editor_undo_count++;
-    memcpy(app->editor_undo_lines[slot], app->editor_lines, sizeof(app->editor_lines));
+    editor_free_undo_slot(app, slot);
+    for (int r = 0; r < app->editor_line_count; r++) {
+        app->editor_undo_lines[slot][r] = dup_text_heap(app->editor_lines[r]);
+        if (!app->editor_undo_lines[slot][r]) {
+            editor_free_undo_slot(app, slot);
+            app->editor_undo_count--;
+            set_status(app, "Out of memory. Undo not saved.");
+            return;
+        }
+    }
     app->editor_undo_line_count[slot] = app->editor_line_count;
     app->editor_undo_row[slot] = app->editor_row;
     app->editor_undo_col[slot] = app->editor_col;
@@ -2843,19 +3222,34 @@ static void editor_undo(App *app) {
         return;
     }
     int slot = --app->editor_undo_count;
-    memcpy(app->editor_lines, app->editor_undo_lines[slot], sizeof(app->editor_lines));
+    editor_free_all_lines(app);
     app->editor_line_count = app->editor_undo_line_count[slot];
+    if (app->editor_line_count < 1) app->editor_line_count = 1;
+    if (app->editor_line_count > EDITOR_LINES) app->editor_line_count = EDITOR_LINES;
+    for (int r = 0; r < app->editor_line_count; r++) {
+        app->editor_lines[r] = app->editor_undo_lines[slot][r];
+        app->editor_undo_lines[slot][r] = NULL;
+        app->editor_line_caps[r] = app->editor_lines[r] ? strlen(app->editor_lines[r]) + 1 : 0;
+        if (!app->editor_lines[r]) editor_clear_line(app, r);
+    }
+    editor_free_undo_slot(app, slot);
     app->editor_row = app->editor_undo_row[slot];
     app->editor_col = app->editor_undo_col[slot];
+    if (app->editor_row < 0) app->editor_row = 0;
+    if (app->editor_row >= app->editor_line_count) app->editor_row = app->editor_line_count - 1;
+    int len = (int)strlen(app->editor_lines[app->editor_row]);
+    if (app->editor_col > len) app->editor_col = len;
     editor_update_desired_col(app);
     set_status(app, "Undo.");
 }
 
 static void editor_insert_char(App *app, int ch) {
-    editor_save_undo(app);
+    if (!editor_ensure_line_capacity(app, app->editor_row, 0)) return;
     char *line = app->editor_lines[app->editor_row];
     int len = (int)strlen(line);
-    if (len + 1 >= EDITOR_COLS) return;
+    if (!editor_ensure_line_capacity(app, app->editor_row, (size_t)len + 1)) return;
+    line = app->editor_lines[app->editor_row];
+    editor_save_undo(app);
     if (app->editor_col < 0) app->editor_col = 0;
     if (app->editor_col > len) app->editor_col = len;
     memmove(line + app->editor_col + 1, line + app->editor_col, (size_t)(len - app->editor_col + 1));
@@ -2866,10 +3260,12 @@ static void editor_insert_char(App *app, int ch) {
 
 static void editor_insert_bytes(App *app, const char *bytes, int byte_count) {
     if (!bytes || byte_count <= 0) return;
-    editor_save_undo(app);
+    if (!editor_ensure_line_capacity(app, app->editor_row, 0)) return;
     char *line = app->editor_lines[app->editor_row];
     int len = (int)strlen(line);
-    if (len + byte_count >= EDITOR_COLS) return;
+    if (!editor_ensure_line_capacity(app, app->editor_row, (size_t)len + (size_t)byte_count)) return;
+    line = app->editor_lines[app->editor_row];
+    editor_save_undo(app);
     if (app->editor_col < 0) app->editor_col = 0;
     if (app->editor_col > len) app->editor_col = len;
     memmove(line + app->editor_col + byte_count, line + app->editor_col,
@@ -3068,10 +3464,9 @@ static void editor_replace_range(App *app, int start_col, int end_col, const cha
     if (end_col < start_col) end_col = start_col;
     if (end_col > len) end_col = len;
     int text_len = (int)strlen(text);
-    if (len - (end_col - start_col) + text_len >= EDITOR_COLS) {
-        set_status(app, "Completion would exceed line limit.");
-        return;
-    }
+    size_t new_len = (size_t)(len - (end_col - start_col) + text_len);
+    if (!editor_ensure_line_capacity(app, app->editor_row, new_len)) return;
+    line = app->editor_lines[app->editor_row];
     editor_save_undo(app);
     memmove(line + start_col + text_len, line + end_col, (size_t)(len - end_col + 1));
     memcpy(line + start_col, text, (size_t)text_len);
@@ -3093,29 +3488,30 @@ static void editor_complete_tui_block(App *app, int start_col, int end_col) {
 
     const char *text = "@tui ";
     int text_len = (int)strlen(text);
-    if (len - (end_col - start_col) + text_len >= EDITOR_COLS) {
-        set_status(app, "Completion would exceed line limit.");
+    size_t new_len = (size_t)(len - (end_col - start_col) + text_len);
+    if (!editor_ensure_line_capacity(app, app->editor_row, new_len)) return;
+    line = app->editor_lines[app->editor_row];
+
+    int indent_len = 0;
+    while (line[indent_len] == ' ' || line[indent_len] == '\t') indent_len++;
+    char *end_line = malloc((size_t)indent_len + 5);
+    if (!end_line) {
+        set_status(app, "Out of memory.");
         return;
     }
-
-    char end_line[EDITOR_COLS];
-    int indent_len = 0;
-    while ((line[indent_len] == ' ' || line[indent_len] == '\t') &&
-           indent_len < EDITOR_COLS - 5) {
-        end_line[indent_len] = line[indent_len];
-        indent_len++;
-    }
+    memcpy(end_line, line, (size_t)indent_len);
     memcpy(end_line + indent_len, "@end", 5);
 
     editor_save_undo(app);
     memmove(line + start_col + text_len, line + end_col, (size_t)(len - end_col + 1));
     memcpy(line + start_col, text, (size_t)text_len);
 
-    for (int r = app->editor_line_count; r > app->editor_row + 1; r--) {
-        copy_text(app->editor_lines[r], EDITOR_COLS, app->editor_lines[r - 1]);
+    if (!editor_insert_empty_line(app, app->editor_row + 1)) {
+        free(end_line);
+        return;
     }
-    copy_text(app->editor_lines[app->editor_row + 1], EDITOR_COLS, end_line);
-    app->editor_line_count++;
+    editor_set_line(app, app->editor_row + 1, end_line);
+    free(end_line);
     app->editor_col = start_col + text_len;
     editor_update_desired_col(app);
     set_status(app, "Completed @tui block.");
@@ -3180,35 +3576,33 @@ static bool editor_try_tab_completion(App *app) {
 
 static void editor_newline(App *app) {
     if (app->editor_line_count >= EDITOR_LINES) return;
-    editor_save_undo(app);
     char *line = app->editor_lines[app->editor_row];
     int len = (int)strlen(line);
     if (app->editor_col > len) app->editor_col = len;
     int indent_len = 0;
     while (line[indent_len] == ' ' || line[indent_len] == '\t') indent_len++;
-    for (int r = app->editor_line_count; r > app->editor_row + 1; r--) {
-        copy_text(app->editor_lines[r], EDITOR_COLS, app->editor_lines[r - 1]);
-    }
-    char next_line[EDITOR_COLS];
-    int pos = 0;
-    int copy_indent = indent_len;
-    if (copy_indent > EDITOR_COLS - 1) copy_indent = EDITOR_COLS - 1;
-    if (copy_indent > 0) {
-        memcpy(next_line, line, (size_t)copy_indent);
-        pos = copy_indent;
-    }
     size_t suffix_len = strlen(line + app->editor_col);
-    if (pos + (int)suffix_len >= EDITOR_COLS) suffix_len = (size_t)(EDITOR_COLS - pos - 1);
-    if (suffix_len > 0) {
-        memcpy(next_line + pos, line + app->editor_col, suffix_len);
-        pos += (int)suffix_len;
+    size_t next_len = (size_t)indent_len + suffix_len;
+    char *next_line = malloc(next_len + 1);
+    if (!next_line) {
+        set_status(app, "Out of memory.");
+        return;
     }
-    next_line[pos] = '\0';
-    copy_text(app->editor_lines[app->editor_row + 1], EDITOR_COLS, next_line);
+    if (indent_len > 0) memcpy(next_line, line, (size_t)indent_len);
+    if (suffix_len > 0) memcpy(next_line + indent_len, line + app->editor_col, suffix_len);
+    next_line[next_len] = '\0';
+
+    editor_save_undo(app);
+    if (!editor_insert_empty_line(app, app->editor_row + 1)) {
+        free(next_line);
+        return;
+    }
+    line = app->editor_lines[app->editor_row];
     line[app->editor_col] = '\0';
-    app->editor_line_count++;
+    editor_set_line(app, app->editor_row + 1, next_line);
+    free(next_line);
     app->editor_row++;
-    app->editor_col = copy_indent;
+    app->editor_col = indent_len;
     editor_update_desired_col(app);
 }
 
@@ -3223,12 +3617,16 @@ static void editor_backspace(App *app) {
         editor_update_desired_col(app);
     } else if (app->editor_row > 0) {
         int prev_len = (int)strlen(app->editor_lines[app->editor_row - 1]);
-        if (prev_len + len + 1 < EDITOR_COLS) {
+        if (editor_ensure_line_capacity(app, app->editor_row - 1, (size_t)prev_len + (size_t)len)) {
             editor_save_undo(app);
             memcpy(app->editor_lines[app->editor_row - 1] + prev_len, line, (size_t)len + 1);
+            free(app->editor_lines[app->editor_row]);
             for (int r = app->editor_row; r < app->editor_line_count - 1; r++) {
-                copy_text(app->editor_lines[r], EDITOR_COLS, app->editor_lines[r + 1]);
+                app->editor_lines[r] = app->editor_lines[r + 1];
+                app->editor_line_caps[r] = app->editor_line_caps[r + 1];
             }
+            app->editor_lines[app->editor_line_count - 1] = NULL;
+            app->editor_line_caps[app->editor_line_count - 1] = 0;
             app->editor_line_count--;
             app->editor_row--;
             app->editor_col = prev_len;
@@ -3241,7 +3639,7 @@ static void editor_delete_lines(App *app, int count) {
     if (count < 1) count = 1;
     editor_save_undo(app);
     if (app->editor_line_count <= 1) {
-        app->editor_lines[0][0] = '\0';
+        editor_clear_line(app, 0);
         app->editor_row = 0;
         app->editor_col = 0;
         return;
@@ -3249,13 +3647,19 @@ static void editor_delete_lines(App *app, int count) {
     if (count > app->editor_line_count - app->editor_row) {
         count = app->editor_line_count - app->editor_row;
     }
+    for (int r = app->editor_row; r < app->editor_row + count; r++) free(app->editor_lines[r]);
     for (int r = app->editor_row; r + count < app->editor_line_count; r++) {
-        copy_text(app->editor_lines[r], EDITOR_COLS, app->editor_lines[r + count]);
+        app->editor_lines[r] = app->editor_lines[r + count];
+        app->editor_line_caps[r] = app->editor_line_caps[r + count];
+    }
+    for (int r = app->editor_line_count - count; r < app->editor_line_count; r++) {
+        app->editor_lines[r] = NULL;
+        app->editor_line_caps[r] = 0;
     }
     app->editor_line_count -= count;
     if (app->editor_line_count < 1) {
         app->editor_line_count = 1;
-        app->editor_lines[0][0] = '\0';
+        editor_clear_line(app, 0);
     }
     if (app->editor_row >= app->editor_line_count) app->editor_row = app->editor_line_count - 1;
     int len = (int)strlen(app->editor_lines[app->editor_row]);
@@ -3270,7 +3674,7 @@ static void editor_copy_lines(App *app, int count) {
     }
     app->editor_clipboard_count = count;
     for (int i = 0; i < count; i++) {
-        copy_text(app->editor_clipboard[i], EDITOR_COLS, app->editor_lines[app->editor_row + i]);
+        editor_set_clipboard_line(app, i, app->editor_lines[app->editor_row + i]);
     }
     set_status(app, "Copied line(s).");
 }
@@ -3287,7 +3691,7 @@ static void editor_copy_line_range(App *app, int start, int end) {
     if (count < 1) return;
     app->editor_clipboard_count = count;
     for (int i = 0; i < count; i++) {
-        copy_text(app->editor_clipboard[i], EDITOR_COLS, app->editor_lines[start + i]);
+        editor_set_clipboard_line(app, i, app->editor_lines[start + i]);
     }
     snprintf(app->status, sizeof(app->status), "Copied %d line(s).", count);
 }
@@ -3364,10 +3768,14 @@ static void editor_paste_lines(App *app, bool above) {
     }
     editor_save_undo(app);
     for (int r = app->editor_line_count - 1; r >= insert_at; r--) {
-        copy_text(app->editor_lines[r + count], EDITOR_COLS, app->editor_lines[r]);
+        app->editor_lines[r + count] = app->editor_lines[r];
+        app->editor_line_caps[r + count] = app->editor_line_caps[r];
     }
     for (int i = 0; i < count; i++) {
-        copy_text(app->editor_lines[insert_at + i], EDITOR_COLS, app->editor_clipboard[i]);
+        app->editor_lines[insert_at + i] = dup_text_heap(app->editor_clipboard[i]);
+        app->editor_line_caps[insert_at + i] = app->editor_lines[insert_at + i] ?
+            strlen(app->editor_lines[insert_at + i]) + 1 : 0;
+        if (!app->editor_lines[insert_at + i]) editor_clear_line(app, insert_at + i);
     }
     app->editor_line_count += count;
     app->editor_row = insert_at;
@@ -3865,17 +4273,19 @@ static void add_case(App *app) {
     memset(&new_case, 0, sizeof(new_case));
     snprintf(new_case.id, sizeof(new_case.id), "TC%03d", app->project.case_count + 1);
     snprintf(new_case.title, sizeof(new_case.title), "new test case");
-    snprintf(new_case.command, sizeof(new_case.command), "true");
+    set_test_command(&new_case, "true");
     new_case.kind = CMD_SHELL;
     new_case.selected = true;
     new_case.expected_exit = 0;
     new_case.check_count = 0;
     new_case.timeout_sec = 30;
     if (!prompt_text("test title", new_case.title, sizeof(new_case.title))) {
+        free_test_case(&new_case);
         set_status(app, "Canceled test title.");
         return;
     }
     if (title_path_conflicts(&new_case, new_case.title)) {
+        free_test_case(&new_case);
         set_status(app, "Script name already exists in this directory.");
         return;
     }
@@ -3901,10 +4311,12 @@ static void delete_case(App *app) {
         make_result_path(deleted_path, result_path, sizeof(result_path));
         result_unlink_rc = unlink(result_path);
     }
+    free_test_case(&app->project.cases[app->selected_case]);
     for (int i = app->selected_case; i < app->project.case_count - 1; i++) {
         app->project.cases[i] = app->project.cases[i + 1];
     }
     app->project.case_count--;
+    if (app->project.case_count >= 0) memset(&app->project.cases[app->project.case_count], 0, sizeof(app->project.cases[app->project.case_count]));
     clamp_selected(app);
     save_test_registry(&app->project);
     if (deleted_path[0] && (unlink_rc != 0 || (result_unlink_rc != 0 && access(result_path, F_OK) == 0))) {
@@ -3948,6 +4360,11 @@ static void copy_case(App *app) {
         return;
     }
     TestCase new_case = app->project.cases[app->selected_case];
+    new_case.command = dup_text_heap(test_command(&app->project.cases[app->selected_case]));
+    if (!new_case.command) {
+        set_status(app, "Out of memory.");
+        return;
+    }
     snprintf(new_case.id, sizeof(new_case.id), "TC%03d", app->project.case_count + 1);
     char default_title[TEXT_LEN];
     copy_text(default_title, sizeof(default_title), new_case.title[0] ? new_case.title : new_case.id);
@@ -3956,10 +4373,12 @@ static void copy_case(App *app) {
     new_case.script_path[0] = '\0';
     new_case.selected = true;
     if (!prompt_text("copy test title", new_case.title, sizeof(new_case.title))) {
+        free_test_case(&new_case);
         set_status(app, "Canceled test copy.");
         return;
     }
     if (title_path_conflicts(&new_case, new_case.title)) {
+        free_test_case(&new_case);
         set_status(app, "Script name already exists in this directory.");
         return;
     }
@@ -3970,8 +4389,10 @@ static void copy_case(App *app) {
         save_test_registry(&app->project);
         set_status(app, "Copied test.");
     } else if (rc == -2) {
+        free_test_case(&new_case);
         set_status(app, "Script name already exists in this directory.");
     } else {
+        free_test_case(&new_case);
         set_status(app, "Failed to copy test.");
     }
 }
@@ -3995,7 +4416,15 @@ static void edit_selected_field(App *app) {
     }
     case 2: tc->selected = !tc->selected; break;
     case 3: cycle_kind(tc); break;
-    case 4: prompt_text("command", tc->command, sizeof(tc->command)); tc->kind = CMD_SHELL; break;
+    case 4: {
+        char command[LONG_LEN];
+        copy_text(command, sizeof(command), test_command(tc));
+        if (prompt_text("command", command, sizeof(command))) {
+            set_test_command(tc, command);
+            tc->kind = CMD_SHELL;
+        }
+        break;
+    }
     case 5: tc->expected_exit = prompt_int("expected_exit", tc->expected_exit); break;
     case 6: prompt_text("check_var", primary_check(tc)->var, sizeof(primary_check(tc)->var)); break;
     case 7: cycle_match(&primary_check(tc)->match); break;
@@ -4210,9 +4639,9 @@ static void write_rescue_continue(FILE *f, const char *indent) {
 }
 
 static void write_capture_checks(FILE *f, const TestCase *tc, const char *indent, const char *dir_expr) {
-    if (command_check_count(tc->command) > 0) return;
+    if (command_check_count(test_command(tc)) > 0) return;
     int count = 0;
-    const char *cursor = tc->command;
+    const char *cursor = test_command(tc);
     bool used_legacy = false;
     CheckRule check;
     while (next_effective_check(tc, &cursor, &check, &used_legacy)) {
@@ -4224,7 +4653,7 @@ static void write_capture_checks(FILE *f, const TestCase *tc, const char *indent
 
 static void write_validate_checks(FILE *f, const TestCase *tc, const char *indent, const char *dir_expr) {
     int count = 0;
-    const char *cursor = tc->command;
+    const char *cursor = test_command(tc);
     bool used_legacy = false;
     CheckRule check;
     while (next_effective_check(tc, &cursor, &check, &used_legacy)) {
@@ -4260,7 +4689,7 @@ static void write_load_tui_metadata(FILE *f, const char *indent, const char *dir
 }
 
 static void write_validate_check_names(FILE *f, const TestCase *tc, const char *indent) {
-    const char *cursor = tc->command;
+    const char *cursor = test_command(tc);
     bool used_legacy = false;
     CheckRule check;
     while (next_effective_check(tc, &cursor, &check, &used_legacy)) {
@@ -4343,13 +4772,13 @@ static void write_case(FILE *f, const TestCase *tc, int index) {
         fprintf(f, "  fi\n");
         fprintf(f, "  if [ \"$mode\" != \"--resume\" ] && [ \"${DETAIL_STDOUT:-0}\" = 1 ]; then printf '1\\n' >\"$state_dir/detail_stdout\"; fi\n");
         fprintf(f, "  cat >\"$state_dir/pre.sh\" <<'AUTOTEST_PRE'\n");
-        write_command_phase(f, tc->command, false);
+        write_command_phase(f, test_command(tc), false);
         fprintf(f, "AUTOTEST_PRE\n");
         fprintf(f, "  cat >\"$state_dir/reboot.sh\" <<'AUTOTEST_REBOOT'\n");
-        write_reboot_command(f, tc->command);
+        write_reboot_command(f, test_command(tc));
         fprintf(f, "AUTOTEST_REBOOT\n");
         fprintf(f, "  cat >\"$state_dir/post.sh\" <<'AUTOTEST_POST'\n");
-        write_command_phase(f, tc->command, true);
+        write_command_phase(f, test_command(tc), true);
         fprintf(f, "AUTOTEST_POST\n");
         fprintf(f, "  chmod 700 \"$state_dir/pre.sh\" \"$state_dir/reboot.sh\" \"$state_dir/post.sh\"\n");
         write_validate_check_names(f, tc, "  ");
@@ -4400,7 +4829,7 @@ static void write_case(FILE *f, const TestCase *tc, int index) {
     fprintf(f, "  mkdir -p \"$actual_dir\"\n");
     fprintf(f, "  body_file=\"$WORK_DIR/case_%03d.body.sh\"\n", index + 1);
     fprintf(f, "  cat >\"$body_file\" <<'AUTOTEST_BODY_%03d'\n", index + 1);
-    write_command_expanded(f, tc->command);
+    write_command_expanded(f, test_command(tc));
     fprintf(f, "AUTOTEST_BODY_%03d\n", index + 1);
     write_validate_check_names(f, tc, "  ");
     fprintf(f, "  ( set -a; . \"$body_file\"; body_rc=\"$?\"; ");
@@ -4824,7 +5253,15 @@ static void run_selected_menu(App *app) {
     }
     case SCREEN_FORM:
         if (app->selected_menu == 0 || app->selected_menu == 1) edit_selected_field(app);
-        else if (app->selected_menu == 2 && app->project.case_count) { app->project.cases[app->selected_case].kind = CMD_SHELL; prompt_text("shell command", app->project.cases[app->selected_case].command, sizeof(app->project.cases[app->selected_case].command)); }
+        else if (app->selected_menu == 2 && app->project.case_count) {
+            TestCase *tc = &app->project.cases[app->selected_case];
+            char command[LONG_LEN];
+            copy_text(command, sizeof(command), test_command(tc));
+            if (prompt_text("shell command", command, sizeof(command))) {
+                set_test_command(tc, command);
+                tc->kind = CMD_SHELL;
+            }
+        }
         else if (app->selected_menu == 3 && app->project.case_count) set_reboot_command(&app->project.cases[app->selected_case]);
         else if (app->selected_menu == 4 && app->project.case_count) set_vim_command(&app->project.cases[app->selected_case]);
         else if (app->selected_menu == 5) {

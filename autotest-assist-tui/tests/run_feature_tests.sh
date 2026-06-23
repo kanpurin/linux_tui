@@ -148,7 +148,7 @@ int main(void) {
     copy_text(tc.title, sizeof(tc.title), "check_position");
     tc.kind = CMD_SHELL;
     tc.expected_exit = 0;
-    copy_text(tc.command, sizeof(tc.command),
+    set_test_command(&tc,
         "TEST=A\\n"
         "@check TEST exact A\\n"
         "TEST=B\\n"
@@ -444,9 +444,9 @@ test_editor_source() {
   grep -Fq 'draw_completion_window(app, height, width, first_row)' "$SRC" &&
   grep -Fq 'vim-write-quit' "$SRC" &&
   grep -Fq -- '-- INSERT --' "$SRC" &&
-  grep -Fq 'first_row = app->editor_row - rows + 1' "$SRC" &&
-  grep -Fq 'line_index = first_row + i' "$SRC" &&
-  grep -Fq 'app->editor_row - first_row' "$SRC" &&
+  grep -Fq 'editor_set_scroll_screen_row(app, scroll, rows, wrap_w)' "$SRC" &&
+  grep -Fq 'for (int line_index = first_row' "$SRC" &&
+  grep -Fq 'screen_row < rows' "$SRC" &&
   grep -Fq 'editor_copy_lines' "$SRC" &&
   grep -Fq 'editor_start_line_range' "$SRC" &&
   grep -Fq 'editor_apply_line_range' "$SRC" &&
@@ -467,14 +467,24 @@ test_editor_source() {
   grep -Fq 'first_param == 1 || first_param == 7' "$SRC" &&
   grep -Fq 'first_param == 4 || first_param == 8' "$SRC" &&
   grep -Fq 'indent_len' "$SRC" &&
-  grep -Fq 'app->editor_col = copy_indent' "$SRC" &&
+  grep -Fq 'app->editor_col = indent_len' "$SRC" &&
   grep -Fq 'editor_first_row' "$SRC" &&
   grep -Fq 'editor_desired_col' "$SRC" &&
   grep -Fq 'editor_index_for_visual_col' "$SRC" &&
   grep -Fq 'editor_move_vertical' "$SRC" &&
   grep -Fq 'editor_ensure_cursor_visible' "$SRC" &&
-  grep -Fq 'app->editor_row < app->editor_first_row' "$SRC" &&
-  grep -Fq 'app->editor_row >= app->editor_first_row + rows' "$SRC" &&
+  grep -Fq 'print_editor_line_segment' "$SRC" &&
+  grep -Fq 'editor_wrapped_rows_for_line' "$SRC" &&
+  grep -Fq 'editor_cursor_screen_row_from_first' "$SRC" &&
+  grep -Fq 'mvprintw(y, 2, "    ")' "$SRC" &&
+  grep -Fq 'editor_ensure_line_capacity' "$SRC" &&
+  grep -Fq 'char *editor_lines[EDITOR_LINES]' "$SRC" &&
+  ! grep -Fq '#define EDITOR_COLS' "$SRC" &&
+  ! grep -Fq '"  > "' "$SRC" &&
+  grep -Fq 'editor_first_wrap_row' "$SRC" &&
+  grep -Fq 'editor_scroll_screen_row' "$SRC" &&
+  grep -Fq 'editor_cursor_screen_row_abs' "$SRC" &&
+  grep -Fq 'editor_set_scroll_screen_row' "$SRC" &&
   grep -Fq 'int first_row = app->editor_first_row' "$SRC" &&
   grep -Fq 'set_escdelay(150)' "$SRC" &&
   grep -Fq 'setlocale(LC_ALL, "")' "$SRC" &&
@@ -487,7 +497,7 @@ test_editor_source() {
   grep -Fq 'ch == KEY_BACKSPACE || ch == KEY_DC' "$SRC" &&
   grep -Fq 'app->editor_command_mode = false' "$SRC" &&
   grep -Fq 'app->editor_search_mode = false' "$SRC" &&
-  grep -Fq 'if (cy <= height - 4' "$SRC" &&
+  grep -Fq 'if (cy >= 6 && cy <= height - 4' "$SRC" &&
   grep -Fq 'case_filter' "$SRC" &&
   grep -Fq 'filtered_case_count' "$SRC" &&
   grep -Fq 'move_filtered_case(app, -1)' "$SRC" &&
@@ -538,6 +548,38 @@ int main(void) {
     if (app.editor_row != 1 || app.editor_col != 1 || app.editor_desired_col != 5) return 9;
     editor_move_vertical(&app, 1);
     if (app.editor_row != 2 || app.editor_col != 5 || app.editor_desired_col != 5) return 10;
+    load_editor_text(&app, "abcdefghij");
+    app.editor_col = 10;
+    if (editor_wrapped_rows_for_line(&app, 0, 5) != 3) return 46;
+    if (editor_cursor_screen_row_from_first(&app, 0, 5) != 2) return 47;
+    app.editor_col = 10;
+    editor_set_scroll_screen_row(&app, 2, 2, 5);
+    if (app.editor_first_row != 0 || app.editor_first_wrap_row != 1) return 50;
+    if (editor_cursor_screen_row_from_first(&app, app.editor_first_row, 5) != 1) return 51;
+    load_editor_text(&app, "");
+    for (int i = 0; i < 2000; i++) editor_insert_char(&app, 'x');
+    if ((int)strlen(app.editor_lines[0]) != 2000) return 48;
+    app.editor_col = 1000;
+    editor_insert_text(&app, "middle");
+    if ((int)strlen(app.editor_lines[0]) != 2006 ||
+        strncmp(app.editor_lines[0] + 1000, "middle", 6) != 0) return 49;
+    load_editor_text(&app, "");
+    for (int i = 0; i < 1700; i++) editor_insert_char(&app, 'a');
+    editor_newline(&app);
+    for (int i = 0; i < 1700; i++) editor_insert_char(&app, 'b');
+    editor_newline(&app);
+    for (int i = 0; i < 1700; i++) editor_insert_char(&app, 'c');
+    char *expected_script = editor_text_alloc(&app);
+    if (!expected_script) return 52;
+    memset(&app.project, 0, sizeof(app.project));
+    app.project.case_count = 1;
+    app.selected_case = 0;
+    copy_text(app.project.cases[0].id, sizeof(app.project.cases[0].id), "TC999");
+    copy_text(app.project.cases[0].title, sizeof(app.project.cases[0].title), "long_save");
+    app.editor_target = EDIT_TARGET_COMMAND;
+    save_editor_to_case(&app);
+    if (strcmp(test_command(&app.project.cases[0]), expected_script) != 0) return 53;
+    free(expected_script);
     load_editor_text(&app, "one\ntwo\nthree\nfour");
     app.editor_row = 1;
     editor_start_line_range(&app, 'y');
@@ -612,7 +654,7 @@ int main(void) {
     app.project.case_count = 3;
     copy_text(app.project.cases[0].id, sizeof(app.project.cases[0].id), "TC001");
     copy_text(app.project.cases[0].title, sizeof(app.project.cases[0].title), "alpha");
-    copy_text(app.project.cases[0].command, sizeof(app.project.cases[0].command), "echo alpha");
+    set_test_command(&app.project.cases[0], "echo alpha");
     copy_text(app.project.cases[1].id, sizeof(app.project.cases[1].id), "TC002");
     copy_text(app.project.cases[1].title, sizeof(app.project.cases[1].title), "beta reboot");
     copy_text(app.project.cases[1].description, sizeof(app.project.cases[1].description), "rescue flow");
@@ -700,7 +742,9 @@ test_registry_source() {
   grep -Fq 'script_path' "$SRC" &&
   grep -Fq 'description' "$SRC" &&
   grep -Fq 'autotest-assist tests v3' "$SRC" &&
-  grep -Fq 'escape_field(fields[6 + LEGACY_REGISTRY_CHECKS * 3 + 1]' "$SRC" &&
+  grep -Fq 'write_escaped_field(f, test_command(tc))' "$SRC" &&
+  grep -Fq 'read_line_alloc' "$SRC" &&
+  grep -Fq 'unescape_field_alloc(fields[18])' "$SRC" &&
   grep -Fq 'unescape_field(tc->description' "$SRC" &&
   grep -Fq 'save_test_registry' "$SRC"
 }
