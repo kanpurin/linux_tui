@@ -253,6 +253,7 @@ static const char *EDITOR_HELP_LINES[] = {
 static void write_match_function(FILE *f);
 static void write_case(FILE *f, const TestCase *tc, int index);
 static void write_summary(FILE *f);
+static void shell_quote(FILE *f, const char *s);
 static void shell_quote_buf(char *dst, size_t dst_sz, const char *src);
 static void write_comment_block(FILE *f, const char *label, const char *text);
 static void auto_configure_test(TestCase *tc);
@@ -1343,24 +1344,26 @@ static void write_shell_line(FILE *f, const char *line, size_t len) {
 static void write_inline_check_capture(FILE *f, const CheckRule *check) {
     const char *var = check->var[0] ? check->var : "AUTOTEST_ACTUAL";
     fputs("AUTOTEST_CHECK_INDEX=$(( ${AUTOTEST_CHECK_INDEX:-0} + 1 ))\n", f);
+    fputs("printf '%s' \"$AUTOTEST_CHECK_INDEX\" >\"$actual_dir/check_count\"\n", f);
+    fputs("printf '%s' ", f);
+    shell_quote(f, var);
+    fputs(" >\"$actual_dir/check_var_${AUTOTEST_CHECK_INDEX}\"\n", f);
+    fputs("printf '%s' ", f);
+    shell_quote(f, match_name(check->match));
+    fputs(" >\"$actual_dir/check_match_${AUTOTEST_CHECK_INDEX}\"\n", f);
+    fputs("printf '%s' ", f);
+    shell_quote(f, check->expected);
+    fputs(" >\"$actual_dir/expected_${AUTOTEST_CHECK_INDEX}\"\n", f);
     fprintf(f, "printf '%%s' \"${%s-}\" >\"$actual_dir/actual_${AUTOTEST_CHECK_INDEX}\"\n", var);
 }
 
 static void write_command_expanded(FILE *f, const char *command) {
     bool in_tui = false;
     char tui_cmd[LONG_LEN];
-    char skip_check_delim[TEXT_LEN] = "";
     const char *p = command;
     while (p && *p) {
         const char *end = strchr(p, '\n');
         size_t len = end ? (size_t)(end - p) : strlen(p);
-        if (skip_check_delim[0]) {
-            char trimmed[TEXT_LEN];
-            trim_line_copy(trimmed, sizeof(trimmed), p, len);
-            if (strcmp(trimmed, skip_check_delim) == 0) skip_check_delim[0] = '\0';
-            p = end ? end + 1 : NULL;
-            continue;
-        }
         if (!in_tui) {
             char directive_arg[LONG_LEN];
             if (line_starts_tui(p, len, tui_cmd, sizeof(tui_cmd))) {
@@ -1398,8 +1401,16 @@ static void write_command_expanded(FILE *f, const char *command) {
                 CheckRule parsed;
                 char heredoc_delim[TEXT_LEN];
                 if (parse_check_arg(directive_arg, &parsed, heredoc_delim, sizeof(heredoc_delim))) {
+                    if (heredoc_delim[0]) {
+                        const char *after = NULL;
+                        collect_check_heredoc(end ? end + 1 : NULL, heredoc_delim,
+                                              parsed.expected, sizeof(parsed.expected), &after);
+                        write_inline_check_capture(f, &parsed);
+                        fputs(": # @check handled by autotest builder\n", f);
+                        p = after;
+                        continue;
+                    }
                     write_inline_check_capture(f, &parsed);
-                    if (heredoc_delim[0]) copy_text(skip_check_delim, sizeof(skip_check_delim), heredoc_delim);
                 }
                 fputs(": # @check handled by autotest builder\n", f);
             } else if (line_is_tui_end(p, len)) {
@@ -3406,6 +3417,9 @@ static bool editor_build_completion(App *app) {
     static const char *check_matches[] = {
         "exact ", "not_exact ", "contains ", "not_contains ", "empty", "not_empty"
     };
+    static const char *shell_blocks[] = {
+        "for ", "if "
+    };
     static const char *tui_vars[] = {
         "AUTOTEST_TUI_STDOUT", "AUTOTEST_TUI_TEXT", "AUTOTEST_TUI_TRANSCRIPT",
         "AUTOTEST_TUI_STDERR", "AUTOTEST_TUI_STATUS", "AUTOTEST_TUI_STDOUT_FILE",
@@ -3449,6 +3463,12 @@ static bool editor_build_completion(App *app) {
             }
         }
         if (!only_indent_before_token && prefix[0] != '@') return false;
+        if (only_indent_before_token && prefix[0] != '@') {
+            for (size_t i = 0; i < sizeof(shell_blocks) / sizeof(shell_blocks[0]); i++) {
+                completion_add(app, shell_blocks[i], prefix);
+            }
+            return app->completion_count > 0;
+        }
         for (size_t i = 0; i < sizeof(directives) / sizeof(directives[0]); i++) {
             completion_add(app, directives[i], prefix);
         }
@@ -3517,6 +3537,67 @@ static void editor_complete_tui_block(App *app, int start_col, int end_col) {
     set_status(app, "Completed @tui block.");
 }
 
+static void editor_complete_shell_block(App *app, int start_col, int end_col, const char *kind) {
+    if (app->editor_line_count + 2 > EDITOR_LINES) {
+        editor_replace_range(app, start_col, end_col, kind);
+        return;
+    }
+
+    char *line = app->editor_lines[app->editor_row];
+    int len = (int)strlen(line);
+    if (start_col < 0) start_col = 0;
+    if (end_col < start_col) end_col = start_col;
+    if (end_col > len) end_col = len;
+
+    int indent_len = 0;
+    while (line[indent_len] == ' ' || line[indent_len] == '\t') indent_len++;
+
+    const char *header = strcmp(kind, "for ") == 0 ? "for item in ; do" : "if [  ]; then";
+    const char *footer = strcmp(kind, "for ") == 0 ? "done" : "fi";
+    int cursor_offset = strcmp(kind, "for ") == 0 ?
+        (int)strlen("for item in ") :
+        (int)strlen("if [ ");
+    int header_len = (int)strlen(header);
+    size_t new_len = (size_t)(len - (end_col - start_col) + header_len);
+    if (!editor_ensure_line_capacity(app, app->editor_row, new_len)) return;
+    line = app->editor_lines[app->editor_row];
+
+    char *body_line = malloc((size_t)indent_len + 3);
+    char *end_line = malloc((size_t)indent_len + strlen(footer) + 1);
+    if (!body_line || !end_line) {
+        free(body_line);
+        free(end_line);
+        set_status(app, "Out of memory.");
+        return;
+    }
+    memcpy(body_line, line, (size_t)indent_len);
+    memcpy(body_line + indent_len, "  ", 3);
+    memcpy(end_line, line, (size_t)indent_len);
+    memcpy(end_line + indent_len, footer, strlen(footer) + 1);
+
+    editor_save_undo(app);
+    memmove(line + start_col + header_len, line + end_col, (size_t)(len - end_col + 1));
+    memcpy(line + start_col, header, (size_t)header_len);
+
+    if (!editor_insert_empty_line(app, app->editor_row + 1)) {
+        free(body_line);
+        free(end_line);
+        return;
+    }
+    editor_set_line(app, app->editor_row + 1, body_line);
+    if (!editor_insert_empty_line(app, app->editor_row + 2)) {
+        free(body_line);
+        free(end_line);
+        return;
+    }
+    editor_set_line(app, app->editor_row + 2, end_line);
+    free(body_line);
+    free(end_line);
+    app->editor_col = start_col + cursor_offset;
+    editor_update_desired_col(app);
+    set_status(app, "Completed shell block.");
+}
+
 static void editor_accept_completion(App *app) {
     if (app->completion_count <= 0) return;
     if (app->completion_selected < 0) app->completion_selected = 0;
@@ -3528,6 +3609,8 @@ static void editor_accept_completion(App *app) {
     completion_reset(app);
     if (strcmp(item, "@tui ") == 0) {
         editor_complete_tui_block(app, start_col, end_col);
+    } else if (strcmp(item, "for ") == 0 || strcmp(item, "if ") == 0) {
+        editor_complete_shell_block(app, start_col, end_col, item);
     } else {
         editor_replace_range(app, start_col, end_col, item);
         set_status(app, "Completed.");
@@ -4652,6 +4735,24 @@ static void write_capture_checks(FILE *f, const TestCase *tc, const char *indent
 }
 
 static void write_validate_checks(FILE *f, const TestCase *tc, const char *indent, const char *dir_expr) {
+    if (command_check_count(test_command(tc)) > 0) {
+        fprintf(f, "%scheck_count=$(cat \"%s/check_count\" 2>/dev/null || echo 0)\n", indent, dir_expr);
+        fprintf(f, "%si=1\n", indent);
+        fprintf(f, "%swhile [ \"$i\" -le \"$check_count\" ]; do\n", indent);
+        fprintf(f, "%s  check_var_i=$(cat \"%s/check_var_$i\" 2>/dev/null || true)\n", indent, dir_expr);
+        fprintf(f, "%s  check_match_i=$(cat \"%s/check_match_$i\" 2>/dev/null || true)\n", indent, dir_expr);
+        fprintf(f, "%s  expected_value_i=$(cat \"%s/expected_$i\" 2>/dev/null || true)\n", indent, dir_expr);
+        fprintf(f, "%s  actual_value_i=$(cat \"%s/actual_$i\" 2>/dev/null || true)\n", indent, dir_expr);
+        fprintf(f, "%s  printf -v \"check_var_$i\" '%%s' \"$check_var_i\"\n", indent);
+        fprintf(f, "%s  printf -v \"check_match_$i\" '%%s' \"$check_match_i\"\n", indent);
+        fprintf(f, "%s  printf -v \"expected_value_$i\" '%%s' \"$expected_value_i\"\n", indent);
+        fprintf(f, "%s  printf -v \"actual_value_$i\" '%%s' \"$actual_value_i\"\n", indent);
+        fprintf(f, "%s  if ! is_valid_var_name \"$check_var_i\"; then ok=0; fi\n", indent);
+        fprintf(f, "%s  match_value \"$check_match_i\" \"$actual_value_i\" \"$expected_value_i\" || ok=0\n", indent);
+        fprintf(f, "%s  i=$((i + 1))\n", indent);
+        fprintf(f, "%sdone\n", indent);
+        return;
+    }
     int count = 0;
     const char *cursor = test_command(tc);
     bool used_legacy = false;
@@ -4783,7 +4884,7 @@ static void write_case(FILE *f, const TestCase *tc, int index) {
         fprintf(f, "  chmod 700 \"$state_dir/pre.sh\" \"$state_dir/reboot.sh\" \"$state_dir/post.sh\"\n");
         write_validate_check_names(f, tc, "  ");
         fprintf(f, "  if [ \"$mode\" = \"--resume\" ]; then\n");
-        fprintf(f, "    ( set -a; [ -f \"$state_dir/env.sh\" ] && . \"$state_dir/env.sh\"; . \"$state_dir/post.sh\"; post_rc=\"$?\"; ");
+        fprintf(f, "    ( set -a; AUTOTEST_CHECK_INDEX=$(cat \"$actual_dir/check_count\" 2>/dev/null || echo 0); [ -f \"$state_dir/env.sh\" ] && . \"$state_dir/env.sh\"; . \"$state_dir/post.sh\"; post_rc=\"$?\"; ");
         write_capture_checks(f, tc, "", "$actual_dir");
         write_capture_tui_metadata(f, "", "$actual_dir");
         fprintf(f, "exit \"$post_rc\" ) >>\"$stdout_file\" 2>>\"$stderr_file\"\n");
@@ -4792,7 +4893,7 @@ static void write_case(FILE *f, const TestCase *tc, int index) {
         fprintf(f, "  fi\n");
         fprintf(f, "  : >\"$stdout_file\"\n");
         fprintf(f, "  : >\"$stderr_file\"\n");
-        fprintf(f, "  ( set -a; . \"$state_dir/pre.sh\"; pre_rc=\"$?\"; ");
+        fprintf(f, "  ( set -a; AUTOTEST_CHECK_INDEX=$(cat \"$actual_dir/check_count\" 2>/dev/null || echo 0); . \"$state_dir/pre.sh\"; pre_rc=\"$?\"; ");
         write_capture_checks(f, tc, "", "$actual_dir");
         write_capture_tui_metadata(f, "", "$actual_dir");
         fprintf(f, "export -p >\"$state_dir/env.sh\"; exit \"$pre_rc\" ) >>\"$stdout_file\" 2>>\"$stderr_file\"\n");
@@ -4812,7 +4913,7 @@ static void write_case(FILE *f, const TestCase *tc, int index) {
         write_load_tui_metadata(f, "", "$actual_dir");
         fprintf(f, "echo \"$status_msg\" >\"$RESULT_FILE\"; autotest_write_detail_outputs; echo 'Reboot command issued. Result check will resume after boot.'; exit 0; fi\n");
         fprintf(f, "  if [ \"$reboot_exit\" -eq 125 ]; then\n");
-        fprintf(f, "    ( set -a; [ -f \"$state_dir/env.sh\" ] && . \"$state_dir/env.sh\"; . \"$state_dir/post.sh\"; post_rc=\"$?\"; ");
+        fprintf(f, "    ( set -a; AUTOTEST_CHECK_INDEX=$(cat \"$actual_dir/check_count\" 2>/dev/null || echo 0); [ -f \"$state_dir/env.sh\" ] && . \"$state_dir/env.sh\"; . \"$state_dir/post.sh\"; post_rc=\"$?\"; ");
         write_capture_checks(f, tc, "", "$actual_dir");
         write_capture_tui_metadata(f, "", "$actual_dir");
         fprintf(f, "exit \"$post_rc\" ) >>\"$stdout_file\" 2>>\"$stderr_file\"\n");
@@ -4832,7 +4933,7 @@ static void write_case(FILE *f, const TestCase *tc, int index) {
     write_command_expanded(f, test_command(tc));
     fprintf(f, "AUTOTEST_BODY_%03d\n", index + 1);
     write_validate_check_names(f, tc, "  ");
-    fprintf(f, "  ( set -a; . \"$body_file\"; body_rc=\"$?\"; ");
+    fprintf(f, "  ( set -a; AUTOTEST_CHECK_INDEX=$(cat \"$actual_dir/check_count\" 2>/dev/null || echo 0); . \"$body_file\"; body_rc=\"$?\"; ");
     write_capture_checks(f, tc, "", "$actual_dir");
     write_capture_tui_metadata(f, "", "$actual_dir");
     fprintf(f, "exit \"$body_rc\" ) >\"$stdout_file\" 2>\"$stderr_file\"\n");

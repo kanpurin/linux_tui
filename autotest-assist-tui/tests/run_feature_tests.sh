@@ -168,6 +168,41 @@ EOF
   )
 }
 
+test_check_loop_runtime_count() {
+  harness="$TMP_ROOT/check_loop.c"
+  cat >"$harness" <<EOF
+#define main autotest_builder_app_main
+#include "$SRC"
+#undef main
+
+int main(void) {
+    TestCase tc;
+    memset(&tc, 0, sizeof(tc));
+    copy_text(tc.id, sizeof(tc.id), "TC998");
+    copy_text(tc.title, sizeof(tc.title), "check_loop");
+    tc.kind = CMD_SHELL;
+    tc.expected_exit = 0;
+    set_test_command(&tc,
+        "for value in 0 1 0; do\\n"
+        "  TEST=\"\$value\"\\n"
+        "  @check TEST exact 0\\n"
+        "done\\n");
+    return write_single_test_script(&tc);
+}
+EOF
+  (
+    cd "$TMP_ROOT" &&
+    gcc -Wall -Wextra -o check_loop "$harness" -lncursesw >/dev/null 2>&1 &&
+    ./check_loop &&
+    ./check_loop.sh --detail check_loop.detail >check_loop.out 2>&1 || true
+    grep -Fq '[NG] TC998 check_loop' check_loop.out &&
+    grep -Fq 'check_count=3' check_loop.detail &&
+    grep -Fq 'actual_1=0' check_loop.detail &&
+    grep -Fq 'actual_2=1' check_loop.detail &&
+    grep -Fq 'actual_3=0' check_loop.detail
+  )
+}
+
 test_assert_true() {
   value="ready"
   if ! [ "$value" = ready ]; then
@@ -342,7 +377,9 @@ test_check_directive_source() {
   grep -Fq 'command_check_count' "$SRC" &&
   grep -Fq 'parse_check_arg' "$SRC" &&
   grep -Fq 'collect_check_heredoc' "$SRC" &&
-  grep -Fq 'skip_check_delim' "$SRC" &&
+  grep -Fq 'AUTOTEST_CHECK_INDEX' "$SRC" &&
+  grep -Fq 'check_count\" 2>/dev/null || echo 0' "$SRC" &&
+  grep -Fq 'printf -v \"actual_value_$i\"' "$SRC" &&
   grep -Fq 'write_validate_checks' "$SRC" &&
   grep -Fq 'AUTOTEST_MATCH_ACTUAL' "$SRC" &&
   grep -Fq 'pattern = \"^(\"' "$SRC" &&
@@ -437,6 +474,9 @@ test_editor_source() {
   grep -Fq 'editor_build_completion' "$SRC" &&
   grep -Fq 'completion_common_prefix' "$SRC" &&
   grep -Fq 'editor_complete_tui_block' "$SRC" &&
+  grep -Fq 'editor_complete_shell_block' "$SRC" &&
+  grep -Fq '"for "' "$SRC" &&
+  grep -Fq '"if "' "$SRC" &&
   grep -Fq 'completion_open' "$SRC" &&
   grep -Fq 'editor_seen_tui_before_current' "$SRC" &&
   grep -Fq 'AUTOTEST_TUI_STDOUT_FILE' "$SRC" &&
@@ -613,6 +653,22 @@ int main(void) {
     if (strcmp(app.editor_lines[0], "  @tui ") != 0 ||
         strcmp(app.editor_lines[1], "  @end") != 0) return 28;
     if (app.editor_row != 0 || app.editor_col != (int)strlen("  @tui ")) return 29;
+    load_editor_text(&app, "fo");
+    app.editor_col = (int)strlen(app.editor_lines[0]);
+    if (!editor_try_tab_completion(&app)) return 54;
+    if (app.editor_line_count != 3 ||
+        strcmp(app.editor_lines[0], "for item in ; do") != 0 ||
+        strcmp(app.editor_lines[1], "  ") != 0 ||
+        strcmp(app.editor_lines[2], "done") != 0) return 55;
+    if (app.editor_row != 0 || app.editor_col != (int)strlen("for item in ")) return 56;
+    load_editor_text(&app, "  if");
+    app.editor_col = (int)strlen(app.editor_lines[0]);
+    if (!editor_try_tab_completion(&app)) return 57;
+    if (app.editor_line_count != 3 ||
+        strcmp(app.editor_lines[0], "  if [  ]; then") != 0 ||
+        strcmp(app.editor_lines[1], "    ") != 0 ||
+        strcmp(app.editor_lines[2], "  fi") != 0) return 58;
+    if (app.editor_row != 0 || app.editor_col != (int)strlen("  if [ ")) return 59;
     load_editor_text(&app, "@check TEST con");
     app.editor_col = (int)strlen(app.editor_lines[0]);
     if (!editor_try_tab_completion(&app)) return 18;
@@ -808,6 +864,7 @@ run_case 'variable match types' test_match_value
 run_case 'multiple variable checks pass' test_multiple_checks_all_pass
 run_case 'multiple variable checks fail as AND' test_multiple_checks_one_fails
 run_case '@check captures value at directive position' test_check_position_capture
+run_case '@check counts loop executions at runtime' test_check_loop_runtime_count
 run_case '@assert true condition' test_assert_true
 run_case '@assert false condition fails' test_assert_false
 run_case '@backup/@restore existing file' test_backup_restore_existing_file
