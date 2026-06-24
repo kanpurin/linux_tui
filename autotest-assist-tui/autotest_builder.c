@@ -113,6 +113,7 @@ typedef struct {
     char case_filter[TEXT_LEN];
     bool selected_only;
     bool run_after_generate;
+    bool stop_on_failure;
     ConfirmAction confirm_action;
     char *editor_lines[EDITOR_LINES];
     size_t editor_line_caps[EDITOR_LINES];
@@ -2598,8 +2599,8 @@ static void draw_dashboard(const App *app, int height, int width) {
     mvprintw(top + 2, left_w + 2, "reboot tests: %s", has_reboot(&app->project) ? "yes" : "no");
     mvprintw(top + 3, left_w + 2, "cleanup script: %s", app->project.cleanup_count ? "yes" : "no");
     mvprintw(top + 4, left_w + 2, "result: OK / NG, final exit 0 / 1");
-    static const char *menu[] = {"Open test list", "Create test", "Preview selected", "Start selected tests", "Help"};
-    draw_menu(15, 1, width - 2, menu, 5, app->selected_menu);
+    static const char *menu[] = {"Open test list", "Create test", "Start selected tests", "Help"};
+    draw_menu(15, 1, width - 2, menu, 4, app->selected_menu);
 }
 
 static void draw_editor(const App *app, int height, int width) {
@@ -2624,8 +2625,8 @@ static void draw_editor(const App *app, int height, int width) {
     if (has_reboot(&app->project)) {
         mvprintw(bottom + 2, 1, "selected reboot tests may interrupt sequential execution");
     }
-    static const char *menu[] = {"Edit test", "Edit description", "Rename test", "Copy test", "Select test", "Delete test", "Print script", "Filter", "Preview selected", "Start selected tests", "Back"};
-    draw_menu(height - 4, 1, width - 2, menu, 11, app->selected_menu);
+    static const char *menu[] = {"Edit test", "Edit description", "Rename test", "Copy test", "Select test", "Delete test", "Print script", "Filter", "Start selected tests", "Back"};
+    draw_menu(height - 4, 1, width - 2, menu, 10, app->selected_menu);
 }
 
 static void draw_form(const App *app, int height, int width) {
@@ -2701,8 +2702,8 @@ static void draw_reboot(const App *app, int height, int width) {
     mvprintw(8, 2, "Selected tests are executed sequentially by their saved paths.");
     mvprintw(9, 2, "If a selected test reboots the machine, the sequence is naturally interrupted.");
     mvprintw(11, 2, "Create a follow-up test and run it after reboot when needed.");
-    static const char *menu[] = {"Preview selected", "Start selected tests", "Back"};
-    draw_menu(height - 4, 1, width - 2, menu, 3, app->selected_menu);
+    static const char *menu[] = {"Start selected tests", "Back"};
+    draw_menu(height - 4, 1, width - 2, menu, 2, app->selected_menu);
 }
 
 static void draw_editor_help(const App *app, int height, int width) {
@@ -3020,8 +3021,8 @@ static void draw_result(const App *app, int height, int width) {
         mvprintw(y++, 2, "Failed to resolve selected result path.");
     }
     mvprintw(height - 8, 2, "Start selected tests writes one aggregate result file in the current directory.");
-    static const char *menu[] = {"Back to tests", "Preview selected", "Dashboard"};
-    draw_menu(height - 4, 1, width - 2, menu, 3, app->selected_menu);
+    static const char *menu[] = {"Back to tests", "Dashboard"};
+    draw_menu(height - 4, 1, width - 2, menu, 2, app->selected_menu);
 }
 
 static void draw_confirm(const App *app, int height, int width) {
@@ -3041,14 +3042,22 @@ static void draw_confirm(const App *app, int height, int width) {
         mvprintw(height - 9, 6, "Delete selected test?");
     } else {
         mvprintw(6, 6, "Selected test scripts may contain risky commands.");
+        if (app->run_after_generate) mvprintw(7, 8, "- choose Stop on NG before starting");
         if (has_reboot(&app->project)) mvprintw(8, 8, "- reboot");
         for (int i = 0; i < app->project.cleanup_count && i < 4; i++) {
             mvprintw(9 + i, 8, "- cleanup: %.*s", width - 22, app->project.cleanups[i]);
         }
         mvprintw(height - 9, 6, app->run_after_generate ? "Start selected tests?" : "Save selected test scripts?");
     }
-    static const char *menu[] = {"Continue", "Back"};
-    draw_menu(height - 7, 6, width - 12, menu, 2, app->selected_menu);
+    if (app->confirm_action == CONFIRM_GENERATE && app->run_after_generate) {
+        char stop_label[32];
+        snprintf(stop_label, sizeof(stop_label), "Stop on NG: %s", app->stop_on_failure ? "yes" : "no");
+        const char *menu[] = {"Start", stop_label, "Back"};
+        draw_menu(height - 7, 6, width - 12, menu, 3, app->selected_menu);
+    } else {
+        static const char *menu[] = {"Continue", "Back"};
+        draw_menu(height - 7, 6, width - 12, menu, 2, app->selected_menu);
+    }
 }
 
 static void draw_app(App *app) {
@@ -4570,6 +4579,21 @@ static void write_match_function(FILE *f) {
     fputs("    *) return 1 ;;\n", f);
     fputs("  esac\n", f);
     fputs("}\n\n", f);
+    fputs("autotest_print_status() {\n", f);
+    fputs("  local msg=\"$1\"\n", f);
+    fputs("  local tag=\"\"\n", f);
+    fputs("  local color=\"\"\n", f);
+    fputs("  local rest=\"\"\n", f);
+    fputs("  case \"$msg\" in\n", f);
+    fputs("    '[OK]'*) tag='[OK]'; color=32; rest=\"${msg:4}\" ;;\n", f);
+    fputs("    '[NG]'*) tag='[NG]'; color=31; rest=\"${msg:4}\" ;;\n", f);
+    fputs("  esac\n", f);
+    fputs("  if [ -n \"$tag\" ] && [ -t 1 ]; then\n", f);
+    fputs("    printf '\\033[%sm%s\\033[0m%s\\n' \"$color\" \"$tag\" \"$rest\"\n", f);
+    fputs("  else\n", f);
+    fputs("    printf '%s\\n' \"$msg\"\n", f);
+    fputs("  fi\n", f);
+    fputs("}\n\n", f);
     fputs("autotest_backup_key() { printf '%s' \"$1\" | cksum | awk '{print $1}'; }\n\n", f);
     fputs("autotest_backup() {\n", f);
     fputs("  path=\"$1\"\n", f);
@@ -4676,7 +4700,7 @@ static void write_match_function(FILE *f) {
     fputs("}\n\n", f);
     fputs("autotest_emit_detail_result() {\n", f);
     fputs("  {\n", f);
-    fputs("    echo \"${status_msg-}\"\n", f);
+    fputs("    if [ \"${AUTOTEST_DETAIL_COLOR:-0}\" = 1 ]; then autotest_print_status \"${status_msg-}\"; else echo \"${status_msg-}\"; fi\n", f);
     fputs("    echo \"Summary: total=$TOTAL_COUNT OK=$OK_COUNT NG=$NG_COUNT\"\n", f);
     fputs("    autotest_detail_kv expected_exit \"${expected_exit-}\"\n", f);
     fputs("    autotest_detail_kv actual_exit \"${actual_exit-}\"\n", f);
@@ -4827,7 +4851,7 @@ static void write_validate_check_names(FILE *f, const TestCase *tc, const char *
         const char *var = check.var[0] ? check.var : "AUTOTEST_ACTUAL";
         fprintf(f, "%sif ! is_valid_var_name ", indent);
         shell_quote(f, var);
-        fprintf(f, "; then status_msg='[NG] invalid check variable name'; echo \"$status_msg\"; echo \"$status_msg\" >\"$RESULT_FILE\"; NG_COUNT=$((NG_COUNT + 1)); return; fi\n");
+        fprintf(f, "; then status_msg='[NG] invalid check variable name'; autotest_print_status \"$status_msg\"; echo \"$status_msg\" >\"$RESULT_FILE\"; NG_COUNT=$((NG_COUNT + 1)); return; fi\n");
     }
 }
 
@@ -4864,15 +4888,13 @@ static void write_case(FILE *f, const TestCase *tc, int index) {
         fprintf(f, "      status_msg=");
         shell_quote(f, ok_msg);
         fprintf(f, "\n");
-        fprintf(f, "      echo \"$status_msg\"\n");
+        fprintf(f, "      autotest_print_status \"$status_msg\"\n");
         fprintf(f, "      OK_COUNT=$((OK_COUNT + 1))\n");
         fprintf(f, "    else\n");
         fprintf(f, "      status_msg=");
         shell_quote(f, ng_prefix);
         fprintf(f, "\"$actual_exit\"\n");
-        fprintf(f, "      echo \"$status_msg\"\n");
-        fprintf(f, "      echo \"     stdout: $stdout_file\"\n");
-        fprintf(f, "      echo \"     stderr: $stderr_file\"\n");
+        fprintf(f, "      autotest_print_status \"$status_msg\"\n");
         fprintf(f, "      NG_COUNT=$((NG_COUNT + 1))\n");
         fprintf(f, "    fi\n");
         fprintf(f, "    {\n");
@@ -4929,7 +4951,7 @@ static void write_case(FILE *f, const TestCase *tc, int index) {
         fprintf(f, "export -p >\"$state_dir/env.sh\"; exit \"$pre_rc\" ) >>\"$stdout_file\" 2>>\"$stderr_file\"\n");
         fprintf(f, "  pre_exit=\"$?\"\n");
         fprintf(f, "  if [ \"$pre_exit\" -ne 0 ]; then finish_reboot_case \"$pre_exit\"; return; fi\n");
-        fprintf(f, "  if [ \"$(id -u)\" -ne 0 ]; then status_msg='[NG] root required for reboot test resume'; echo \"$status_msg\"; echo \"$status_msg\" >\"$RESULT_FILE\"; NG_COUNT=$((NG_COUNT + 1)); return; fi\n");
+        fprintf(f, "  if [ \"$(id -u)\" -ne 0 ]; then status_msg='[NG] root required for reboot test resume'; autotest_print_status \"$status_msg\"; echo \"$status_msg\" >\"$RESULT_FILE\"; NG_COUNT=$((NG_COUNT + 1)); return; fi\n");
         fprintf(f, "  self_path=\"$(readlink -f \"$0\")\"\n");
         fprintf(f, "  cat >\"/etc/systemd/system/$unit_name\" <<AUTOTEST_UNIT\n");
         fprintf(f, "[Unit]\nDescription=AutoTest %s resume\nDefaultDependencies=no\nAfter=sysinit.target\nBefore=rescue.service\nBefore=shutdown.target\nConflicts=shutdown.target\n\n", safe_id);
@@ -4976,16 +4998,13 @@ static void write_case(FILE *f, const TestCase *tc, int index) {
     fprintf(f, "    status_msg=");
     shell_quote(f, ok_msg);
     fprintf(f, "\n");
-    fprintf(f, "    echo \"$status_msg\"\n");
+    fprintf(f, "    autotest_print_status \"$status_msg\"\n");
     fprintf(f, "    OK_COUNT=$((OK_COUNT + 1))\n");
     fprintf(f, "  else\n");
     fprintf(f, "    status_msg=");
     shell_quote(f, ng_prefix);
     fprintf(f, "\"$actual_exit\"\n");
-    fprintf(f, "    echo \"$status_msg\"\n");
-    fprintf(f, "    echo \"     actual: $actual_dir\"\n");
-    fprintf(f, "    echo \"     stdout: $stdout_file\"\n");
-    fprintf(f, "    echo \"     stderr: $stderr_file\"\n");
+    fprintf(f, "    autotest_print_status \"$status_msg\"\n");
     fprintf(f, "    NG_COUNT=$((NG_COUNT + 1))\n");
     fprintf(f, "  fi\n");
     fprintf(f, "  autotest_write_detail_outputs\n");
@@ -5058,6 +5077,7 @@ static int write_resume_automation(App *app, char *runner_path, size_t runner_sz
     fprintf(f, "SUMMARY_PATH=");
     shell_quote_str(f, result_path);
     fprintf(f, "\n");
+    fprintf(f, "STOP_ON_FAILURE=%d\n", app->stop_on_failure ? 1 : 0);
     fprintf(f, "ids=(");
     for (int i = 0; i < app->project.case_count; i++) {
         TestCase *tc = &app->project.cases[i];
@@ -5104,6 +5124,14 @@ static int write_resume_automation(App *app, char *runner_path, size_t runner_sz
     fprintf(f, "  rm -rf \"$STATE_DIR\"\n");
     write_rescue_continue(f, "  ");
     fprintf(f, "}\n");
+    fprintf(f, "stop_after_failure_if_needed() {\n");
+    fprintf(f, "  failures=$(read_num \"$FAIL_FILE\")\n");
+    fprintf(f, "  if [ \"$STOP_ON_FAILURE\" = 1 ] && [ \"$failures\" -gt 0 ]; then\n");
+    fprintf(f, "    log \"[NG] selected test sequence stopped after failure failures=$failures\"\n");
+    fprintf(f, "    cleanup_selected_runner\n");
+    fprintf(f, "    exit 1\n");
+    fprintf(f, "  fi\n");
+    fprintf(f, "}\n");
     fprintf(f, "check_waiting_reboot() {\n");
     fprintf(f, "  [ -f \"$WAIT_SAFE_FILE\" ] || return 0\n");
     fprintf(f, "  safe_id=$(cat \"$WAIT_SAFE_FILE\")\n");
@@ -5129,7 +5157,9 @@ static int write_resume_automation(App *app, char *runner_path, size_t runner_sz
     fprintf(f, "}\n");
     fprintf(f, "mkdir -p \"$STATE_DIR\"\n");
     fprintf(f, "touch \"$SUMMARY_PATH\"\n");
+    fprintf(f, "log \"stop_on_ng=$([ \"$STOP_ON_FAILURE\" = 1 ] && echo yes || echo no)\"\n");
     fprintf(f, "check_waiting_reboot\n");
+    fprintf(f, "stop_after_failure_if_needed\n");
     fprintf(f, "idx=$(read_num \"$INDEX_FILE\")\n");
     fprintf(f, "failures=$(read_num \"$FAIL_FILE\")\n");
     fprintf(f, "while [ \"$idx\" -lt \"$count\" ]; do\n");
@@ -5151,6 +5181,7 @@ static int write_resume_automation(App *app, char *runner_path, size_t runner_sz
     fprintf(f, "      failures=$((failures + 1))\n");
     fprintf(f, "      write_failures \"$failures\"\n");
     fprintf(f, "      rm -f \"$WAIT_SAFE_FILE\" \"$WAIT_RESULT_FILE\"\n");
+    fprintf(f, "      stop_after_failure_if_needed\n");
     fprintf(f, "      idx=$((idx + 1))\n");
     fprintf(f, "      echo \"$idx\" >\"$INDEX_FILE\"\n");
     fprintf(f, "      continue\n");
@@ -5164,11 +5195,13 @@ static int write_resume_automation(App *app, char *runner_path, size_t runner_sz
     fprintf(f, "    if grep -q '^\\[NG\\]' \"$result_file\" 2>/dev/null; then failures=$((failures + 1)); fi\n");
     fprintf(f, "    if [ -f \"$result_file\" ]; then cat \"$result_file\" >>\"$SUMMARY_PATH\"; echo >>\"$SUMMARY_PATH\"; rm -f \"$result_file\"; fi\n");
     fprintf(f, "    write_failures \"$failures\"\n");
+    fprintf(f, "    stop_after_failure_if_needed\n");
     fprintf(f, "  else\n");
     fprintf(f, "    bash \"$path\"\n");
     fprintf(f, "    rc=$?\n");
     fprintf(f, "    if [ \"$rc\" -ne 0 ]; then failures=$((failures + 1)); write_failures \"$failures\"; fi\n");
     fprintf(f, "    if [ -f \"$result_file\" ]; then cat \"$result_file\" >>\"$SUMMARY_PATH\"; echo >>\"$SUMMARY_PATH\"; rm -f \"$result_file\"; fi\n");
+    fprintf(f, "    stop_after_failure_if_needed\n");
     fprintf(f, "  fi\n");
     fprintf(f, "  idx=$((idx + 1))\n");
     fprintf(f, "  echo \"$idx\" >\"$INDEX_FILE\"\n");
@@ -5265,6 +5298,7 @@ static void start_selected_test_scripts(App *app) {
     if (result) {
         fprintf(result, "AutoTest selected result\n");
         fprintf(result, "cwd=%s\n\n", getcwd(output_path, sizeof(output_path)) ? output_path : ".");
+        fprintf(result, "stop_on_ng=%s\n\n", app->stop_on_failure ? "yes" : "no");
     }
     int index = 1;
     for (int i = 0; i < app->project.case_count; i++) {
@@ -5276,6 +5310,11 @@ static void start_selected_test_scripts(App *app) {
                 printf("[NG] %s %s failed to create test script\n", tc->id, tc->title);
                 if (result) fprintf(result, "[NG] %s %s failed to create test script\n\n", tc->id, tc->title);
                 ng_count++;
+                if (app->stop_on_failure) {
+                    printf("Stopping selected tests after failure.\n");
+                    if (result) fprintf(result, "Stopped after failure.\n\n");
+                    break;
+                }
                 continue;
             }
         }
@@ -5312,6 +5351,11 @@ static void start_selected_test_scripts(App *app) {
                 fprintf(result, "\n");
             }
             unlink(result_path);
+        }
+        if (exit_code != 0 && app->stop_on_failure) {
+            printf("Stopping selected tests after failure.\n");
+            if (result) fprintf(result, "Stopped after failure.\n\n");
+            break;
         }
         if (tc->kind == CMD_REBOOT) {
             printf("Reboot test was executed. If the machine rebooted, run remaining tests after boot.\n");
@@ -5356,8 +5400,7 @@ static void run_selected_menu(App *app) {
     case SCREEN_DASHBOARD:
         if (app->selected_menu == 0) { app->screen = SCREEN_EDITOR; app->selected_menu = 0; }
         else if (app->selected_menu == 1) add_case(app);
-        else if (app->selected_menu == 2) { app->selected_only = true; preview_script(app); app->screen = SCREEN_PREVIEW; app->selected_menu = 0; }
-        else if (app->selected_menu == 3) {
+        else if (app->selected_menu == 2) {
             if (selected_count(&app->project) == 0) set_status(app, "Select at least one test before starting.");
             else { app->selected_only = true; app->run_after_generate = true; app->confirm_action = CONFIRM_GENERATE; app->previous_screen = app->screen; app->screen = SCREEN_CONFIRM; app->selected_menu = 0; }
         }
@@ -5373,12 +5416,11 @@ static void run_selected_menu(App *app) {
         else if (app->selected_menu == 5 && has_visible_case) { app->confirm_action = CONFIRM_DELETE; app->previous_screen = app->screen; app->screen = SCREEN_CONFIRM; app->selected_menu = 0; }
         else if (app->selected_menu == 6 && has_visible_case) print_current_test_script(app);
         else if (app->selected_menu == 7) edit_case_filter(app);
-        else if (app->selected_menu == 8) { app->selected_only = true; preview_script(app); app->screen = SCREEN_PREVIEW; app->selected_menu = 0; }
-        else if (app->selected_menu == 9) {
+        else if (app->selected_menu == 8) {
             if (selected_count(&app->project) == 0) set_status(app, "Select at least one test before starting.");
             else { app->selected_only = true; app->run_after_generate = true; app->confirm_action = CONFIRM_GENERATE; app->previous_screen = app->screen; app->screen = SCREEN_CONFIRM; app->selected_menu = 0; }
         }
-        else if (app->selected_menu == 10) { app->screen = SCREEN_DASHBOARD; app->selected_menu = 0; }
+        else if (app->selected_menu == 9) { app->screen = SCREEN_DASHBOARD; app->selected_menu = 0; }
         else if (!has_visible_case && app->selected_menu <= 6) set_status(app, "No visible test for current filter.");
         break;
     }
@@ -5436,12 +5478,11 @@ static void run_selected_menu(App *app) {
         else if (app->selected_menu == 5) { app->screen = SCREEN_EDITOR; app->selected_menu = 0; }
         break;
     case SCREEN_REBOOT:
-        if (app->selected_menu == 0) { app->selected_only = true; preview_script(app); app->screen = SCREEN_PREVIEW; app->selected_menu = 0; }
-        else if (app->selected_menu == 1) {
+        if (app->selected_menu == 0) {
             if (selected_count(&app->project) == 0) set_status(app, "Select at least one test before starting.");
             else { app->run_after_generate = true; app->confirm_action = CONFIRM_GENERATE; app->previous_screen = app->screen; app->screen = SCREEN_CONFIRM; app->selected_menu = 0; }
         }
-        else if (app->selected_menu == 2) { app->screen = SCREEN_EDITOR; app->selected_menu = 0; }
+        else if (app->selected_menu == 1) { app->screen = SCREEN_EDITOR; app->selected_menu = 0; }
         break;
     case SCREEN_SCRIPT_EDITOR:
         break;
@@ -5454,32 +5495,46 @@ static void run_selected_menu(App *app) {
         break;
     case SCREEN_RESULT:
         if (app->selected_menu == 0) { app->screen = SCREEN_EDITOR; app->selected_menu = 0; }
-        else if (app->selected_menu == 1) { preview_script(app); app->screen = SCREEN_PREVIEW; app->selected_menu = 0; }
-        else if (app->selected_menu == 2) { app->screen = SCREEN_DASHBOARD; app->selected_menu = 0; }
+        else if (app->selected_menu == 1) { app->screen = SCREEN_DASHBOARD; app->selected_menu = 0; }
         break;
     case SCREEN_CONFIRM:
-        if (app->selected_menu == 0) {
-            if (app->confirm_action == CONFIRM_DELETE) {
+        if (app->confirm_action == CONFIRM_DELETE) {
+            if (app->selected_menu == 0) {
                 delete_case(app);
                 app->screen = app->previous_screen;
                 app->selected_menu = 0;
-            } else if (app->run_after_generate) {
+            } else {
+                app->screen = app->previous_screen;
+                app->selected_menu = 0;
+            }
+        } else if (app->run_after_generate) {
+            if (app->selected_menu == 0) {
                 start_selected_test_scripts(app);
                 app->run_after_generate = false;
                 app->screen = SCREEN_RESULT;
                 app->selected_menu = 0;
                 set_status(app, "Finished selected test sequence.");
-            } else if (save_selected_test_scripts(app) == 0) {
-                app->screen = SCREEN_RESULT;
-                app->selected_menu = 0;
-                set_status(app, "Saved selected test scripts in current directory.");
+            } else if (app->selected_menu == 1) {
+                app->stop_on_failure = !app->stop_on_failure;
+                set_status(app, app->stop_on_failure ? "Stop on NG enabled." : "Stop on NG disabled.");
             } else {
-                set_status(app, "Failed to generate scripts.");
                 app->screen = app->previous_screen;
+                app->selected_menu = 0;
             }
         } else {
-            app->screen = app->previous_screen;
-            app->selected_menu = 0;
+            if (app->selected_menu == 0) {
+                if (save_selected_test_scripts(app) == 0) {
+                    app->screen = SCREEN_RESULT;
+                    app->selected_menu = 0;
+                    set_status(app, "Saved selected test scripts in current directory.");
+                } else {
+                    set_status(app, "Failed to generate scripts.");
+                    app->screen = app->previous_screen;
+                }
+            } else {
+                app->screen = app->previous_screen;
+                app->selected_menu = 0;
+            }
         }
         break;
     }
@@ -5487,16 +5542,16 @@ static void run_selected_menu(App *app) {
 
 static int menu_count_for(Screen s) {
     switch (s) {
-    case SCREEN_DASHBOARD: return 5;
-    case SCREEN_EDITOR: return 11;
+    case SCREEN_DASHBOARD: return 4;
+    case SCREEN_EDITOR: return 10;
     case SCREEN_FORM: return 7;
     case SCREEN_MATCH: return 1;
     case SCREEN_CLEANUP: return 6;
-    case SCREEN_REBOOT: return 3;
+    case SCREEN_REBOOT: return 2;
     case SCREEN_SCRIPT_EDITOR: return 1;
     case SCREEN_PREVIEW: return 6;
-    case SCREEN_RESULT: return 3;
-    case SCREEN_CONFIRM: return 2;
+    case SCREEN_RESULT: return 2;
+    case SCREEN_CONFIRM: return 3;
     }
     return 1;
 }
@@ -5507,6 +5562,10 @@ static void handle_key(App *app, int ch) {
         return;
     }
     int mc = menu_count_for(app->screen);
+    if (app->screen == SCREEN_CONFIRM &&
+        !(app->confirm_action == CONFIRM_GENERATE && app->run_after_generate)) {
+        mc = 2;
+    }
     switch (ch) {
     case KEY_UP:
         if (app->screen == SCREEN_EDITOR && app->project.case_count > 0) {

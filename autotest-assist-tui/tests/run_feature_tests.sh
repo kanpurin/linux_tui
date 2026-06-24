@@ -196,6 +196,9 @@ EOF
     ./check_loop &&
     ./check_loop.sh --detail check_loop.detail >check_loop.out 2>&1 || true
     grep -Fq '[NG] TC998 check_loop' check_loop.out &&
+    ! grep -Fq 'actual:' check_loop.out &&
+    ! grep -Fq 'stdout:' check_loop.out &&
+    ! grep -Fq 'stderr:' check_loop.out &&
     grep -Fq 'check_count=3' check_loop.detail &&
     grep -Fq 'actual_1=0' check_loop.detail &&
     grep -Fq 'actual_2=1' check_loop.detail &&
@@ -355,6 +358,12 @@ test_detail_result_source() {
   grep -Fq 'expected_ref=\"expected_value_$i\"' "$SRC" &&
   grep -Fq 'value=\"${!value_ref}\"' "$SRC" &&
   grep -Fq 'expected=\"${!expected_ref}\"' "$SRC" &&
+  grep -Fq 'autotest_print_status()' "$SRC" &&
+  grep -Fq 'autotest_print_status \"$status_msg\"' "$SRC" &&
+  grep -Fq '\\033[%sm%s\\033[0m%s\\n' "$SRC" &&
+  ! grep -Fq 'echo \"     actual: $actual_dir\"' "$SRC" &&
+  ! grep -Fq 'echo \"     stdout: $stdout_file\"' "$SRC" &&
+  ! grep -Fq 'echo \"     stderr: $stderr_file\"' "$SRC" &&
   grep -Fq 'check_match_%d=' "$SRC" &&
   grep -Fq 'expected_value_%d=' "$SRC" &&
   grep -Fq '[ -s \"$stdout_file\" ]' "$SRC" &&
@@ -844,7 +853,18 @@ test_result_display_source() {
   grep -Fq 'Selected Test Results' "$SRC" &&
   grep -Fq 'Start selected tests writes one aggregate result file' "$SRC" &&
   grep -Fq 'AutoTest selected result' "$SRC" &&
+  ! grep -Fq 'Preview selected' "$SRC" &&
+  grep -Fq 'bool stop_on_failure' "$SRC" &&
+  grep -Fq 'Stop on NG' "$SRC" &&
+  grep -Fq 'choose Stop on NG before starting' "$SRC" &&
+  grep -Fq 'const char *menu[] = {"Start", stop_label, "Back"}' "$SRC" &&
+  grep -Fq 'app->selected_menu == 1' "$SRC" &&
+  grep -Fq 'stop_on_ng=%s' "$SRC" &&
+  grep -Fq 'Stopping selected tests after failure.' "$SRC" &&
+  grep -Fq 'STOP_ON_FAILURE=%d' "$SRC" &&
+  grep -Fq 'stop_after_failure_if_needed' "$SRC" &&
   grep -Fq 'autotest_selected.result' "$README" &&
+  grep -Fq 'Stop on NG' "$README" &&
   grep -Fq 'one aggregate result file' "$README" &&
   grep -Fq 'Summary: total=%d OK=%d NG=%d' "$SRC" &&
   grep -Fq 'append_file_to_stream(result, result_path)' "$SRC" &&

@@ -178,6 +178,13 @@ Each selected test is still executed sequentially, but the selected-run result
 is reported through this single aggregate file. Individual test `.result` files
 created as part of the run are folded into the aggregate result and removed.
 
+After choosing `Start selected tests`, the confirmation screen lets you choose
+`Stop on NG`. When it is enabled, the runner writes the failed test result to
+`autotest_selected.result`, prints that it stopped after the failure, and does
+not start the remaining selected tests. The same setting is embedded into the
+reboot-capable selected runner, so tests after a failed reboot test are also
+skipped after the machine resumes.
+
 Linux 向けの「自動テスト作成支援」TUI です。`Create test` から独自エディタを開いてテストを作成し、作成済みテストを複数選択して自動テストを開始できます。
 
 生成されるテストスクリプトは、各テスト項目を実行し、終了コードと出力判定から結果を `OK` または `NG` として表示します。
