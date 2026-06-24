@@ -537,7 +537,9 @@ test_editor_source() {
   grep -Fq 'ch == KEY_BACKSPACE || ch == KEY_DC' "$SRC" &&
   grep -Fq 'app->editor_command_mode = false' "$SRC" &&
   grep -Fq 'app->editor_search_mode = false' "$SRC" &&
-  grep -Fq 'if (cy >= 6 && cy <= height - 4' "$SRC" &&
+  grep -Fq 'editor_cursor_position' "$SRC" &&
+  grep -Fq 'draw_status(app, height - 1, width)' "$SRC" &&
+  grep -Fq 'curs_set(1)' "$SRC" &&
   grep -Fq 'case_filter' "$SRC" &&
   grep -Fq 'filtered_case_count' "$SRC" &&
   grep -Fq 'move_filtered_case(app, -1)' "$SRC" &&
@@ -596,6 +598,12 @@ int main(void) {
     editor_set_scroll_screen_row(&app, 2, 2, 5);
     if (app.editor_first_row != 0 || app.editor_first_wrap_row != 1) return 50;
     if (editor_cursor_screen_row_from_first(&app, app.editor_first_row, 5) != 1) return 51;
+    app.screen = SCREEN_SCRIPT_EDITOR;
+    app.editor_insert = true;
+    int cursor_y = 0;
+    int cursor_x = 0;
+    if (!editor_cursor_position(&app, 20, 20, &cursor_y, &cursor_x)) return 60;
+    if (cursor_y < 6 || cursor_x < 7) return 61;
     load_editor_text(&app, "");
     for (int i = 0; i < 2000; i++) editor_insert_char(&app, 'x');
     if ((int)strlen(app.editor_lines[0]) != 2000) return 48;

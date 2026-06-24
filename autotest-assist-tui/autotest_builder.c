@@ -1037,7 +1037,13 @@ static void editor_clamp_scroll(App *app, int rows) {
 
 static int editor_cursor_screen_row_from_first(const App *app, int first_row, int wrap_w) {
     int scroll = editor_line_screen_start(app, first_row, wrap_w);
-    if (first_row == app->editor_first_row) scroll += app->editor_first_wrap_row;
+    if (first_row == app->editor_first_row) {
+        int wrapped = editor_wrapped_rows_for_line(app, first_row, wrap_w);
+        int first_wrap = app->editor_first_wrap_row;
+        if (first_wrap < 0) first_wrap = 0;
+        if (first_wrap >= wrapped) first_wrap = wrapped - 1;
+        scroll += first_wrap;
+    }
     return editor_cursor_screen_row_abs(app, wrap_w) - scroll;
 }
 
@@ -2789,6 +2795,23 @@ static void draw_completion_window(const App *app, int height, int width, int fi
     mvaddch(y + box_h - 1, x + box_w - 1, ACS_LRCORNER);
 }
 
+static bool editor_cursor_position(const App *app, int height, int width, int *out_y, int *out_x) {
+    if (!app || app->screen != SCREEN_SCRIPT_EDITOR || !app->editor_insert) return false;
+    int rows = editor_visible_rows(app, height);
+    int wrap_w = width - 9;
+    if (wrap_w < 1) wrap_w = 1;
+    int first_row = app->editor_first_row;
+    if (first_row < 0) first_row = 0;
+    if (first_row >= app->editor_line_count) first_row = app->editor_line_count - 1;
+    int cy = 6 + editor_cursor_screen_row_from_first(app, first_row, wrap_w);
+    int cursor_visual = editor_visual_col(app->editor_lines[app->editor_row], app->editor_col);
+    int cx = 7 + (cursor_visual % wrap_w);
+    if (cy < 6 || cy >= 6 + rows || cy > height - 4 || cx < 7 || cx >= width - 1) return false;
+    if (out_y) *out_y = cy;
+    if (out_x) *out_x = cx;
+    return true;
+}
+
 static void draw_script_editor(const App *app, int height, int width) {
     draw_header(app, width);
     char title[TEXT_LEN];
@@ -2871,10 +2894,9 @@ static void draw_script_editor(const App *app, int height, int width) {
         draw_completion_window(app, height, width, first_row);
     }
     if (app->editor_insert) {
-        int cy = 6 + editor_cursor_screen_row_from_first(app, first_row, wrap_w);
-        int cursor_visual = editor_visual_col(app->editor_lines[app->editor_row], app->editor_col);
-        int cx = 7 + (cursor_visual % wrap_w);
-        if (cy >= 6 && cy <= height - 4 && cx < width - 1) move(cy, cx);
+        int cy = 0;
+        int cx = 0;
+        if (editor_cursor_position(app, height, width, &cy, &cx)) move(cy, cx);
     }
 }
 
@@ -3052,6 +3074,14 @@ static void draw_app(App *app) {
     case SCREEN_CONFIRM: draw_confirm(app, height, width); break;
     }
     draw_status(app, height - 1, width);
+    if (app->screen == SCREEN_SCRIPT_EDITOR && app->editor_insert) {
+        int cy = 0;
+        int cx = 0;
+        if (editor_cursor_position(app, height, width, &cy, &cx)) {
+            curs_set(1);
+            move(cy, cx);
+        }
+    }
     refresh();
 }
 
