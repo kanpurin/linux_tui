@@ -1,5 +1,7 @@
 # AutoTest Script Builder TUI
 
+For test script authoring rules and examples, see [HOWTO.md](HOWTO.md).
+
 ## Reboot and Rescue Limitations
 
 Reboot tests can run while systemd is still moving between targets. In that
@@ -74,6 +76,29 @@ line2
 EOF
 ```
 
+## `@capture` Output Capture
+
+Use `@capture <command>` when you want to run a shell command and assert its
+stdout, stderr, or exit status without manually assigning variables:
+
+```sh
+@capture systemctl is-active ssh
+
+@check AUTOTEST_STDOUT exact active
+@check AUTOTEST_STATUS exact 0
+@check AUTOTEST_STDERR empty
+```
+
+Each `@capture` updates these variables:
+
+- `AUTOTEST_STDOUT`: stdout from the captured command.
+- `AUTOTEST_STDERR`: stderr from the captured command.
+- `AUTOTEST_STATUS`: exit status from the captured command.
+- `AUTOTEST_STDOUT_FILE` / `AUTOTEST_STDERR_FILE`: backing files.
+
+`@capture` itself returns success so a non-zero captured command does not stop
+the test script. Check `AUTOTEST_STATUS` when the status matters.
+
 ## `@tui` Output Capture
 
 Each `@tui` block stores the most recent pseudo-terminal session output in
@@ -122,6 +147,9 @@ Use Up/Down to scroll the help window when the terminal is small. PageUp,
 PageDown, Home, and End are also supported. Close the help window with `Esc`,
 `Enter`, or `q`.
 
+The editor supports Vim-like visual selection. Use `v` for character selection,
+`V` for line selection, `y` to copy the selection, and `d` or `x` to delete it.
+
 ## Generated Script Names
 
 When a test is saved, the generated script name is based on the test title:
@@ -164,6 +192,38 @@ made visible instead of being sent back to the terminal. For reboot tests, the
 detail output settings are saved before reboot and reused by the resume run.
 
 Unknown options or unexpected arguments print usage and exit with status `2`.
+
+## Evidence Output
+
+Use `--evidence <path>` to enable evidence logging:
+
+```sh
+./test1.sh --evidence evidence.log
+```
+
+Evidence output is explicit. The generated script does not copy stdout, stderr,
+result summaries, or detail output automatically. It writes only:
+
+- test start comments
+- reboot/resume comments for reboot tests
+- comments from `@evidence-comment <text>`
+- prompted command lines and command output from `@evidence <command>`
+
+Example:
+
+```bash
+@evidence-comment before creating files
+@evidence find /tmp/foo -maxdepth 3 -print
+```
+
+The prompted command line uses this format:
+
+```text
+[root@osboxes:autotest-assist-tui]# find /tmp/foo -maxdepth 3 -print
+```
+
+`@evidence` commands are skipped unless `--evidence` is specified, and their
+exit status does not affect the test result.
 
 ## Selected Test Result
 

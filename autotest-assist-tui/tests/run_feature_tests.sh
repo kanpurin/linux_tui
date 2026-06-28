@@ -206,6 +206,82 @@ EOF
   )
 }
 
+test_evidence_directives() {
+  harness="$TMP_ROOT/evidence_case.c"
+  cat >"$harness" <<EOF
+#define main autotest_builder_app_main
+#include "$SRC"
+#undef main
+
+int main(void) {
+    TestCase tc;
+    memset(&tc, 0, sizeof(tc));
+    copy_text(tc.id, sizeof(tc.id), "TC997");
+    copy_text(tc.title, sizeof(tc.title), "evidence_case");
+    tc.kind = CMD_SHELL;
+    tc.expected_exit = 0;
+    set_test_command(&tc,
+        "VALUE=hello\\n"
+        "@evidence-comment capture value\\n"
+        "@evidence echo \$VALUE\\n"
+        "@evidence sh -c 'echo side-effect > evidence_side_effect'\\n"
+        "TEST=ok\\n"
+        "@check TEST exact ok\\n");
+    return write_single_test_script(&tc);
+}
+EOF
+  (
+    cd "$TMP_ROOT" &&
+    gcc -Wall -Wextra -o evidence_case "$harness" -lncursesw >/dev/null 2>&1 &&
+    ./evidence_case &&
+    ./evidence_case.sh >evidence_no_option.out 2>&1 &&
+    [ ! -f evidence_side_effect ] &&
+    ./evidence_case.sh --evidence evidence.log >evidence.out 2>&1 &&
+    [ "$(cat evidence_side_effect)" = "side-effect" ] &&
+    grep -Fq '# TEST TC997 evidence_case START ' evidence.log &&
+    grep -Fq '# capture value' evidence.log &&
+    grep -Eq '^\[[^]]+@[^]]+:autotest-assist-feature-tests\.[^]]+\]# echo \$VALUE$' evidence.log &&
+    grep -Fq 'hello' evidence.log &&
+    ! grep -Fq 'Summary:' evidence.log &&
+    ! grep -Fq 'evidence command exit' evidence.log
+  )
+}
+
+test_capture_directive() {
+  harness="$TMP_ROOT/capture_case.c"
+  cat >"$harness" <<EOF
+#define main autotest_builder_app_main
+#include "$SRC"
+#undef main
+
+int main(void) {
+    TestCase tc;
+    memset(&tc, 0, sizeof(tc));
+    copy_text(tc.id, sizeof(tc.id), "TC996");
+    copy_text(tc.title, sizeof(tc.title), "capture_case");
+    tc.kind = CMD_SHELL;
+    tc.expected_exit = 0;
+    set_test_command(&tc,
+        "@capture sh -c 'printf hello; printf warn >&2; exit 7'\\n"
+        "@check AUTOTEST_STDOUT exact hello\\n"
+        "@check AUTOTEST_STDERR exact warn\\n"
+        "@check AUTOTEST_STATUS exact 7\\n");
+    return write_single_test_script(&tc);
+}
+EOF
+  (
+    cd "$TMP_ROOT" &&
+    gcc -Wall -Wextra -o capture_case "$harness" -lncursesw >/dev/null 2>&1 &&
+    ./capture_case &&
+    ./capture_case.sh --detail capture.detail >capture.out 2>&1 &&
+    grep -Fq '[OK] TC996 capture_case' capture.out &&
+    grep -Fq 'check_count=3' capture.detail &&
+    grep -Fq 'actual_1=hello' capture.detail &&
+    grep -Fq 'actual_2=warn' capture.detail &&
+    grep -Fq 'actual_3=7' capture.detail
+  )
+}
+
 test_assert_true() {
   value="ready"
   if ! [ "$value" = ready ]; then
@@ -421,6 +497,46 @@ test_backup_restore_source() {
   grep -Fq 'autotest_restore()' "$SRC"
 }
 
+test_evidence_source() {
+  grep -Fq '@evidence <command>' "$SRC" &&
+  grep -Fq '@evidence-comment <text>' "$SRC" &&
+  grep -Fq -- '--evidence <path>' "$SRC" &&
+  grep -Fq -- '--evidence)' "$SRC" &&
+  grep -Fq -- '--evidence=*)' "$SRC" &&
+  grep -Fq 'EVIDENCE_FILE' "$SRC" &&
+  grep -Fq 'autotest_evidence_prompt()' "$SRC" &&
+  grep -Fq "printf '[%s@%s:%s]# '" "$SRC" &&
+  grep -Fq 'autotest_evidence_comment()' "$SRC" &&
+  grep -Fq 'autotest_evidence_test_start()' "$SRC" &&
+  grep -Fq 'autotest_evidence_reboot()' "$SRC" &&
+  grep -Fq 'autotest_evidence_resume()' "$SRC" &&
+  grep -Fq 'eval \"$cmd\"' "$SRC" &&
+  grep -Fq 'evidence_file' "$SRC" &&
+  grep -Fq '@evidence requires a command' "$SRC" &&
+  grep -Fq '@evidence-comment requires text' "$SRC" &&
+  grep -Fq 'Evidence Output' "$README" &&
+  grep -Fq '@evidence-comment <text>' "$README" &&
+  grep -Fq '@evidence <command>' "$README" &&
+  grep -Fq '[root@osboxes:autotest-assist-tui]#' "$README"
+}
+
+test_capture_source() {
+  grep -Fq '@capture <command>' "$SRC" &&
+  grep -Fq 'autotest_capture()' "$SRC" &&
+  grep -Fq 'AUTOTEST_STDOUT_FILE' "$SRC" &&
+  grep -Fq 'AUTOTEST_STDERR_FILE' "$SRC" &&
+  grep -Fq 'AUTOTEST_STATUS=' "$SRC" &&
+  grep -Fq 'AUTOTEST_STDOUT=' "$SRC" &&
+  grep -Fq 'AUTOTEST_STDERR=' "$SRC" &&
+  grep -Fq 'export AUTOTEST_CAPTURE_INDEX AUTOTEST_CAPTURE_DIR AUTOTEST_STATUS AUTOTEST_STDOUT AUTOTEST_STDERR AUTOTEST_STDOUT_FILE AUTOTEST_STDERR_FILE' "$SRC" &&
+  grep -Fq 'line_starts_directive(p, len, "@capture"' "$SRC" &&
+  grep -Fq '@capture requires a command' "$SRC" &&
+  grep -Fq 'editor_seen_capture_before_current' "$SRC" &&
+  grep -Fq '"AUTOTEST_STDOUT"' "$SRC" &&
+  grep -Fq '`@capture` Output Capture' "$README" &&
+  grep -Fq '@check AUTOTEST_STDOUT exact active' "$README"
+}
+
 test_reboot_if_source() {
   grep -Fq '@reboot-if' "$SRC" &&
   grep -Fq 'exit 125' "$SRC"
@@ -491,8 +607,14 @@ test_editor_source() {
   grep -Fq 'AUTOTEST_TUI_STDOUT_FILE' "$SRC" &&
   grep -Fq 'cursor_y + 1' "$SRC" &&
   grep -Fq 'draw_completion_window(app, height, width, first_row)' "$SRC" &&
+  grep -Fq 'if (app->editor_command_mode)' "$SRC" &&
+  grep -Fq 'if (app->editor_search_mode)' "$SRC" &&
+  grep -Fq 'if (app->screen == SCREEN_SCRIPT_EDITOR)' "$SRC" &&
+  ! grep -Fq 'A_UNDERLINE' "$SRC" &&
+  ! grep -Fq 'draw_editor_cursor' "$SRC" &&
   grep -Fq 'vim-write-quit' "$SRC" &&
   grep -Fq -- '-- INSERT --' "$SRC" &&
+  grep -Fq 'int rows = height - 10' "$SRC" &&
   grep -Fq 'editor_set_scroll_screen_row(app, scroll, rows, wrap_w)' "$SRC" &&
   grep -Fq 'for (int line_index = first_row' "$SRC" &&
   grep -Fq 'screen_row < rows' "$SRC" &&
@@ -501,6 +623,17 @@ test_editor_source() {
   grep -Fq 'editor_apply_line_range' "$SRC" &&
   grep -Fq 'editor_range_pending' "$SRC" &&
   grep -Fq 'editor_paste_lines' "$SRC" &&
+  grep -Fq 'VISUAL_CHAR' "$SRC" &&
+  grep -Fq 'VISUAL_LINE' "$SRC" &&
+  grep -Fq 'editor_start_visual' "$SRC" &&
+  grep -Fq 'editor_cancel_visual' "$SRC" &&
+  grep -Fq 'editor_copy_visual_chars' "$SRC" &&
+  grep -Fq 'editor_delete_visual_chars' "$SRC" &&
+  grep -Fq 'editor_visual_line_selected' "$SRC" &&
+  grep -Fq 'editor_visual_char_selected' "$SRC" &&
+  grep -Fq 'editor_is_visual_motion_key' "$SRC" &&
+  grep -Fq -- '-- VISUAL --' "$SRC" &&
+  grep -Fq -- '-- VISUAL LINE --' "$SRC" &&
   grep -Fq 'editor_search_next' "$SRC" &&
   grep -Fq 'editor_goto_line' "$SRC" &&
   grep -Fq 'editor_help_open' "$SRC" &&
@@ -536,6 +669,13 @@ test_editor_source() {
   grep -Fq 'editor_set_scroll_screen_row' "$SRC" &&
   grep -Fq 'int first_row = app->editor_first_row' "$SRC" &&
   grep -Fq 'set_escdelay(150)' "$SRC" &&
+  grep -Fq '#include <termios.h>' "$SRC" &&
+  grep -Fq 'save_terminal_settings' "$SRC" &&
+  grep -Fq 'disable_terminal_flow_control' "$SRC" &&
+  grep -Fq 'restore_terminal_flow_control' "$SRC" &&
+  grep -Fq 'IXON | IXOFF' "$SRC" &&
+  grep -Fq 'tcsetattr(STDIN_FILENO' "$SRC" &&
+  grep -Fq 'save_terminal_settings();' "$SRC" &&
   grep -Fq 'setlocale(LC_ALL, "")' "$SRC" &&
   grep -Fq 'meta(stdscr, TRUE)' "$SRC" &&
   grep -Fq 'get_wch' "$SRC" &&
@@ -608,11 +748,23 @@ int main(void) {
     if (app.editor_first_row != 0 || app.editor_first_wrap_row != 1) return 50;
     if (editor_cursor_screen_row_from_first(&app, app.editor_first_row, 5) != 1) return 51;
     app.screen = SCREEN_SCRIPT_EDITOR;
-    app.editor_insert = true;
+    app.editor_insert = false;
     int cursor_y = 0;
     int cursor_x = 0;
     if (!editor_cursor_position(&app, 20, 20, &cursor_y, &cursor_x)) return 60;
     if (cursor_y < 6 || cursor_x < 7) return 61;
+    app.editor_command_mode = true;
+    copy_text(app.editor_command, sizeof(app.editor_command), "wq");
+    app.editor_command_len = 2;
+    if (!editor_cursor_position(&app, 20, 20, &cursor_y, &cursor_x)) return 62;
+    if (cursor_y != 16 || cursor_x != 5) return 63;
+    app.editor_command_mode = false;
+    app.editor_search_mode = true;
+    copy_text(app.editor_search, sizeof(app.editor_search), "word");
+    app.editor_search_len = 4;
+    if (!editor_cursor_position(&app, 20, 20, &cursor_y, &cursor_x)) return 64;
+    if (cursor_y != 16 || cursor_x != 7) return 65;
+    app.editor_search_mode = false;
     load_editor_text(&app, "");
     for (int i = 0; i < 2000; i++) editor_insert_char(&app, 'x');
     if ((int)strlen(app.editor_lines[0]) != 2000) return 48;
@@ -620,6 +772,29 @@ int main(void) {
     editor_insert_text(&app, "middle");
     if ((int)strlen(app.editor_lines[0]) != 2006 ||
         strncmp(app.editor_lines[0] + 1000, "middle", 6) != 0) return 49;
+    load_editor_text(&app, "abcdef\nsecond\nthird");
+    app.editor_col = 1;
+    editor_start_visual(&app, VISUAL_CHAR);
+    app.editor_col = 3;
+    if (!editor_copy_visual_chars(&app)) return 66;
+    if (!app.editor_char_clipboard || strcmp(app.editor_char_clipboard, "bcd") != 0) return 67;
+    editor_delete_visual_chars(&app);
+    if (strcmp(app.editor_lines[0], "aef") != 0) return 68;
+    editor_cancel_visual(&app);
+    app.editor_col = (int)strlen(app.editor_lines[0]);
+    editor_paste_text(&app, app.editor_char_clipboard);
+    if (strcmp(app.editor_lines[0], "aefbcd") != 0) return 69;
+    load_editor_text(&app, "one\ntwo\nthree");
+    editor_start_visual(&app, VISUAL_LINE);
+    app.editor_row = 2;
+    if (!editor_visual_line_selected(&app, 0) ||
+        !editor_visual_line_selected(&app, 1) ||
+        !editor_visual_line_selected(&app, 2)) return 70;
+    editor_copy_line_range(&app, app.editor_visual_anchor_row, app.editor_row);
+    if (app.editor_clipboard_count != 3 ||
+        strcmp(app.editor_clipboard[0], "one") != 0 ||
+        strcmp(app.editor_clipboard[2], "three") != 0) return 71;
+    if (app.editor_char_clipboard) return 72;
     load_editor_text(&app, "");
     for (int i = 0; i < 1700; i++) editor_insert_char(&app, 'a');
     editor_newline(&app);
@@ -663,6 +838,10 @@ int main(void) {
     app.editor_col = 3;
     if (!editor_try_tab_completion(&app)) return 16;
     if (strcmp(app.editor_lines[0], "@check ") != 0) return 17;
+    load_editor_text(&app, "@cap");
+    app.editor_col = (int)strlen(app.editor_lines[0]);
+    if (!editor_try_tab_completion(&app)) return 73;
+    if (strcmp(app.editor_lines[0], "@capture ") != 0) return 74;
     load_editor_text(&app, "  @tu");
     app.editor_col = (int)strlen(app.editor_lines[0]);
     if (!editor_try_tab_completion(&app)) return 26;
@@ -720,6 +899,11 @@ int main(void) {
     app.editor_col = (int)strlen("@check AU");
     if (!editor_try_tab_completion(&app)) return 38;
     if (strcmp(app.editor_lines[2], "@check AUTOTEST_TUI_ exact ok") != 0) return 39;
+    load_editor_text(&app, "@capture printf ok\n@check AUTOTEST_STDOUT_F exact ok");
+    app.editor_row = 1;
+    app.editor_col = (int)strlen("@check AUTOTEST_STDOUT_F");
+    if (!editor_try_tab_completion(&app)) return 75;
+    if (strcmp(app.editor_lines[1], "@check AUTOTEST_STDOUT_FILE exact ok") != 0) return 76;
     load_editor_text(&app, "AUTOTEST_TUI_STDOUT_F");
     app.editor_col = (int)strlen(app.editor_lines[0]);
     if (editor_try_tab_completion(&app)) return 25;
@@ -799,6 +983,8 @@ int main(void) {
     if (expect_invalid_line("@tui vim\n  bogus\n@end\n", 2)) return 4;
     if (expect_invalid_line("@check TEST exact <<EOF\nhello\n", 1)) return 5;
     if (expect_invalid_line("@tui vim\n  send \"unterminated\n@end\n", 2)) return 6;
+    if (expect_invalid_line("@capture\n", 1)) return 8;
+    if (expect_valid("@capture printf ok\n@check AUTOTEST_STDOUT exact ok\n")) return 9;
     if (!validate_script_syntax("if true; then\n  echo ok\n", &(SyntaxError){0})) return 0;
     return 7;
 }
@@ -893,6 +1079,8 @@ run_case 'multiple variable checks pass' test_multiple_checks_all_pass
 run_case 'multiple variable checks fail as AND' test_multiple_checks_one_fails
 run_case '@check captures value at directive position' test_check_position_capture
 run_case '@check counts loop executions at runtime' test_check_loop_runtime_count
+run_case '@evidence directives write explicit evidence only' test_evidence_directives
+run_case '@capture captures stdout stderr and status' test_capture_directive
 run_case '@assert true condition' test_assert_true
 run_case '@assert false condition fails' test_assert_false
 run_case '@backup/@restore existing file' test_backup_restore_existing_file
@@ -902,6 +1090,8 @@ run_case '@tui send/text argument quoting' test_tui_argument_quoting
 run_case '@check source support' test_check_directive_source
 run_case '@assert source support' test_assert_directive_source
 run_case '@backup/@restore source support' test_backup_restore_source
+run_case '@evidence source support' test_evidence_source
+run_case '@capture source support' test_capture_source
 run_case '@reboot-if source support' test_reboot_if_source
 run_case '@tui source support' test_tui_source
 run_case '@tui output capture source support' test_tui_capture_source
