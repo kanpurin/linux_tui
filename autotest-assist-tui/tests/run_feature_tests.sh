@@ -4,6 +4,8 @@ set -u
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 SRC="$ROOT_DIR/autotest_builder.c"
 README="$ROOT_DIR/README.md"
+HOWTO="$ROOT_DIR/HOWTO.md"
+MAKEFILE="$ROOT_DIR/Makefile"
 FAILURES=0
 TMP_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/autotest-assist-feature-tests.XXXXXX")"
 
@@ -235,7 +237,9 @@ EOF
     gcc -Wall -Wextra -o evidence_case "$harness" -lncursesw >/dev/null 2>&1 &&
     ./evidence_case &&
     ./evidence_case.sh >evidence_no_option.out 2>&1 &&
-    [ ! -f evidence_side_effect ] &&
+    [ "$(cat evidence_side_effect)" = "side-effect" ] &&
+    ! grep -Fq 'hello' evidence_no_option.out &&
+    rm -f evidence_side_effect &&
     ./evidence_case.sh --evidence evidence.log >evidence.out 2>&1 &&
     [ "$(cat evidence_side_effect)" = "side-effect" ] &&
     grep -Fq '# TEST TC997 evidence_case START ' evidence.log &&
@@ -244,6 +248,46 @@ EOF
     grep -Fq 'hello' evidence.log &&
     ! grep -Fq 'Summary:' evidence.log &&
     ! grep -Fq 'evidence command exit' evidence.log
+  )
+}
+
+test_evidence_capture_directive() {
+  harness="$TMP_ROOT/evidence_capture_case.c"
+  cat >"$harness" <<EOF
+#define main autotest_builder_app_main
+#include "$SRC"
+#undef main
+
+int main(void) {
+    TestCase tc;
+    memset(&tc, 0, sizeof(tc));
+    copy_text(tc.id, sizeof(tc.id), "TC995");
+    copy_text(tc.title, sizeof(tc.title), "evidence_capture_case");
+    tc.kind = CMD_SHELL;
+    tc.expected_exit = 0;
+    set_test_command(&tc,
+        "@evidence-comment run command\\n"
+        "@evidence-capture sh -c 'printf out; printf err >&2; exit 7'\\n"
+        "@check AUTOTEST_STDOUT exact out\\n"
+        "@check AUTOTEST_STDERR exact err\\n"
+        "@check AUTOTEST_STATUS exact 7\\n");
+    return write_single_test_script(&tc);
+}
+EOF
+  (
+    cd "$TMP_ROOT" &&
+    gcc -Wall -Wextra -o evidence_capture_case "$harness" -lncursesw >/dev/null 2>&1 &&
+    ./evidence_capture_case &&
+    ./evidence_capture_case.sh --evidence evidence_capture.log --detail evidence_capture.detail >evidence_capture.out 2>&1 &&
+    grep -Fq '[OK] TC995 evidence_capture_case' evidence_capture.out &&
+    grep -Fq '# run command' evidence_capture.log &&
+    grep -Eq '^\[[^]]+@[^]]+:autotest-assist-feature-tests\.[^]]+\]# sh -c' evidence_capture.log &&
+    grep -Fq 'out' evidence_capture.log &&
+    grep -Fq 'err' evidence_capture.log &&
+    grep -Fq '# exit status: 7' evidence_capture.log &&
+    grep -Fq 'actual_1=out' evidence_capture.detail &&
+    grep -Fq 'actual_2=err' evidence_capture.detail &&
+    grep -Fq 'actual_3=7' evidence_capture.detail
   )
 }
 
@@ -499,6 +543,7 @@ test_backup_restore_source() {
 
 test_evidence_source() {
   grep -Fq '@evidence <command>' "$SRC" &&
+  grep -Fq '@evidence-capture <command>' "$SRC" &&
   grep -Fq '@evidence-comment <text>' "$SRC" &&
   grep -Fq -- '--evidence <path>' "$SRC" &&
   grep -Fq -- '--evidence)' "$SRC" &&
@@ -510,14 +555,25 @@ test_evidence_source() {
   grep -Fq 'autotest_evidence_test_start()' "$SRC" &&
   grep -Fq 'autotest_evidence_reboot()' "$SRC" &&
   grep -Fq 'autotest_evidence_resume()' "$SRC" &&
+  grep -Fq 'autotest_evidence_capture()' "$SRC" &&
   grep -Fq 'eval \"$cmd\"' "$SRC" &&
+  grep -Fq '( set +u; eval \"$cmd\" ) >/dev/null 2>&1' "$SRC" &&
+  grep -Fq 'cat \"$AUTOTEST_STDOUT_FILE\" >>\"$EVIDENCE_FILE\"' "$SRC" &&
+  grep -Fq '# exit status: %s' "$SRC" &&
   grep -Fq 'evidence_file' "$SRC" &&
   grep -Fq '@evidence requires a command' "$SRC" &&
+  grep -Fq '@evidence-capture requires a command' "$SRC" &&
   grep -Fq '@evidence-comment requires text' "$SRC" &&
   grep -Fq 'Evidence Output' "$README" &&
   grep -Fq '@evidence-comment <text>' "$README" &&
   grep -Fq '@evidence <command>' "$README" &&
-  grep -Fq '[root@osboxes:autotest-assist-tui]#' "$README"
+  grep -Fq '@evidence-capture <command>' "$README" &&
+  grep -Fq '# exit status: N' "$README" &&
+  grep -Fq '[root@osboxes:autotest-assist-tui]#' "$README" &&
+  grep -Fq '@evidence-capture command' "$HOWTO" &&
+  grep -Fq '@evidence-capture ./test.sh /etc/conf' "$HOWTO" &&
+  grep -Fq '# exit status: N' "$HOWTO" &&
+  grep -Fq 'Default style for tests that modify a path' "$HOWTO"
 }
 
 test_capture_source() {
@@ -641,6 +697,7 @@ test_editor_source() {
   grep -Fq 'strcmp(app->editor_command, "help")' "$SRC" &&
   grep -Fq 'app->editor_target == EDIT_TARGET_COMMAND) return true' "$SRC" &&
   grep -Fq 'strcmp(app->editor_command, "template")' "$SRC" &&
+  grep -Fq '{"path", "(\\.{1,2}/|/)?[^[:space:]:]+"}' "$SRC" &&
   grep -Fq 'editor_handle_escape_sequence' "$SRC" &&
   grep -Fq 'if (!editor_handle_escape_sequence(app))' "$SRC" &&
   grep -Fq "seq[0] == '[' && n >= 2" "$SRC" &&
@@ -985,6 +1042,8 @@ int main(void) {
     if (expect_invalid_line("@tui vim\n  send \"unterminated\n@end\n", 2)) return 6;
     if (expect_invalid_line("@capture\n", 1)) return 8;
     if (expect_valid("@capture printf ok\n@check AUTOTEST_STDOUT exact ok\n")) return 9;
+    if (expect_invalid_line("@evidence-capture\n", 1)) return 10;
+    if (expect_valid("@evidence-capture printf ok\n@check AUTOTEST_STDOUT exact ok\n")) return 11;
     if (!validate_script_syntax("if true; then\n  echo ok\n", &(SyntaxError){0})) return 0;
     return 7;
 }
@@ -1006,6 +1065,24 @@ test_registry_source() {
   grep -Fq 'unescape_field_alloc(fields[18])' "$SRC" &&
   grep -Fq 'unescape_field(tc->description' "$SRC" &&
   grep -Fq 'save_test_registry' "$SRC"
+}
+
+test_make_regenerates_scripts_source() {
+  grep -Fq 'regenerate_registered_scripts' "$SRC" &&
+  grep -Fq 'strcmp(argv[1], "--regen-scripts")' "$SRC" &&
+  grep -Fq 'Usage: %s [--regen-scripts]' "$SRC" &&
+  grep -Fq 'Regenerated %d registered test scripts.' "$SRC" &&
+  grep -Fq '.PHONY: all clean run regen-scripts' "$MAKEFILE" &&
+  grep -Fq 'all: $(TARGET) regen-scripts' "$MAKEFILE" &&
+  grep -Fq './$(TARGET) --regen-scripts' "$MAKEFILE"
+}
+
+test_make_regenerates_scripts_behavior() {
+  (
+    cd "$TMP_ROOT" &&
+    HOME="$TMP_ROOT/home-empty-registry" "$ROOT_DIR/autotest-builder" --regen-scripts >regen.out 2>&1 &&
+    grep -Fq 'Regenerated 0 registered test scripts.' regen.out
+  )
 }
 
 test_description_source() {
@@ -1041,15 +1118,33 @@ test_result_display_source() {
   grep -Fq 'AutoTest selected result' "$SRC" &&
   ! grep -Fq 'Preview selected' "$SRC" &&
   grep -Fq 'bool stop_on_failure' "$SRC" &&
+  grep -Fq 'bool selected_evidence' "$SRC" &&
   grep -Fq 'Stop on NG' "$SRC" &&
-  grep -Fq 'choose Stop on NG before starting' "$SRC" &&
-  grep -Fq 'const char *menu[] = {"Start", stop_label, "Back"}' "$SRC" &&
+  grep -Fq 'Evidence: %s' "$SRC" &&
+  grep -Fq 'choose Stop on NG / Evidence before starting' "$SRC" &&
+  grep -Fq 'const char *menu[] = {"Start", stop_label, evidence_label, "Back"}' "$SRC" &&
   grep -Fq 'app->selected_menu == 1' "$SRC" &&
+  grep -Fq 'app->selected_menu == 2' "$SRC" &&
   grep -Fq 'stop_on_ng=%s' "$SRC" &&
+  grep -Fq 'evidence=%s' "$SRC" &&
+  grep -Fq 'selected_evidence_dir_path' "$SRC" &&
+  grep -Fq 'selected_evidence_file_path' "$SRC" &&
+  grep -Fq 'autotest_selected_evidence' "$SRC" &&
+  grep -Fq -- '--evidence %s' "$SRC" &&
+  grep -Fq 'EVIDENCE_ENABLED=%d' "$SRC" &&
+  grep -Fq 'evidence_paths=(' "$SRC" &&
   grep -Fq 'Stopping selected tests after failure.' "$SRC" &&
   grep -Fq 'STOP_ON_FAILURE=%d' "$SRC" &&
   grep -Fq 'stop_after_failure_if_needed' "$SRC" &&
+  grep -Fq 'print_status_colored_line' "$SRC" &&
+  grep -Fq 'append_file_to_stdout_colored' "$SRC" &&
+  grep -Fq '\033[%sm%s\033[0m%s' "$SRC" &&
+  grep -Fq 'print_status_colored()' "$SRC" &&
+  grep -Fq '32m[OK]' "$SRC" &&
+  grep -Fq '31m[NG]' "$SRC" &&
   grep -Fq 'autotest_selected.result' "$README" &&
+  grep -Fq 'autotest_selected_evidence' "$README" &&
+  grep -Fq 'Evidence` defaults to `no`' "$README" &&
   grep -Fq 'Stop on NG' "$README" &&
   grep -Fq 'one aggregate result file' "$README" &&
   grep -Fq 'Summary: total=%d OK=%d NG=%d' "$SRC" &&
@@ -1080,6 +1175,7 @@ run_case 'multiple variable checks fail as AND' test_multiple_checks_one_fails
 run_case '@check captures value at directive position' test_check_position_capture
 run_case '@check counts loop executions at runtime' test_check_loop_runtime_count
 run_case '@evidence directives write explicit evidence only' test_evidence_directives
+run_case '@evidence-capture writes evidence and captures values' test_evidence_capture_directive
 run_case '@capture captures stdout stderr and status' test_capture_directive
 run_case '@assert true condition' test_assert_true
 run_case '@assert false condition fails' test_assert_false
@@ -1100,6 +1196,8 @@ run_case 'editor UTF-8 behavior' test_editor_utf8_behavior
 run_case 'save-time syntax validation source support' test_syntax_validation_source
 run_case 'save-time syntax validation behavior' test_syntax_validation_behavior
 run_case 'registry source support' test_registry_source
+run_case 'make regenerates registered scripts source support' test_make_regenerates_scripts_source
+run_case 'regen scripts handles empty registry' test_make_regenerates_scripts_behavior
 run_case 'test description source support' test_description_source
 run_case 'delete test source support' test_delete_source
 run_case 'result display source support' test_result_display_source

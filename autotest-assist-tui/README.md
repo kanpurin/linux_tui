@@ -2,6 +2,15 @@
 
 For test script authoring rules and examples, see [HOWTO.md](HOWTO.md).
 
+## Build
+
+```sh
+make
+```
+
+`make` builds `autotest-builder` and then regenerates all test scripts currently
+registered in `~/.config/autotest-assist/tests.tsv`.
+
 ## Reboot and Rescue Limitations
 
 Reboot tests can run while systemd is still moving between targets. In that
@@ -208,6 +217,7 @@ result summaries, or detail output automatically. It writes only:
 - reboot/resume comments for reboot tests
 - comments from `@evidence-comment <text>`
 - prompted command lines and command output from `@evidence <command>`
+- prompted command lines and command output from `@evidence-capture <command>`
 
 Example:
 
@@ -222,8 +232,12 @@ The prompted command line uses this format:
 [root@osboxes:autotest-assist-tui]# find /tmp/foo -maxdepth 3 -print
 ```
 
-`@evidence` commands are skipped unless `--evidence` is specified, and their
-exit status does not affect the test result.
+`@evidence` commands always run. When `--evidence` is not specified, their
+stdout and stderr are discarded. When `--evidence` is specified, their output is
+written to the evidence file. Their exit status does not affect the test result.
+Use `@evidence-capture` when the same command should also update
+`AUTOTEST_STDOUT`, `AUTOTEST_STDERR`, and `AUTOTEST_STATUS` for `@check`.
+`@evidence-capture` also appends `# exit status: N` to the evidence log.
 
 ## Selected Test Result
 
@@ -239,9 +253,17 @@ is reported through this single aggregate file. Individual test `.result` files
 created as part of the run are folded into the aggregate result and removed.
 
 After choosing `Start selected tests`, the confirmation screen lets you choose
-`Stop on NG`. When it is enabled, the runner writes the failed test result to
+`Stop on NG` and `Evidence`. `Evidence` defaults to `no`. When it is enabled,
+each selected test is run with `--evidence` and writes its evidence file under:
+
+```sh
+./autotest_selected_evidence/
+```
+
+The aggregate result records `evidence=yes`, `evidence_dir=...`, and the
+per-test evidence file path. `Stop on NG` writes the failed test result to
 `autotest_selected.result`, prints that it stopped after the failure, and does
-not start the remaining selected tests. The same setting is embedded into the
+not start the remaining selected tests. The same settings are embedded into the
 reboot-capable selected runner, so tests after a failed reboot test are also
 skipped after the machine resumes.
 

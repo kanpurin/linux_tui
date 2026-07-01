@@ -6,12 +6,15 @@ LDLIBS ?= -lncursesw
 TARGET := autotest-builder
 SRC := autotest_builder.c
 
-.PHONY: all clean run
+.PHONY: all clean run regen-scripts
 
-all: $(TARGET)
+all: $(TARGET) regen-scripts
 
 $(TARGET): $(SRC)
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $< $(LDLIBS)
+
+regen-scripts: $(TARGET)
+	./$(TARGET) --regen-scripts
 
 run: $(TARGET)
 	./$(TARGET)

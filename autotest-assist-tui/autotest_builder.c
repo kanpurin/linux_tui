@@ -1,6 +1,7 @@
 #define _XOPEN_SOURCE_EXTENDED 1
 
 #include <ctype.h>
+#include <errno.h>
 #include <limits.h>
 #include <locale.h>
 #include <ncurses.h>
@@ -121,6 +122,7 @@ typedef struct {
     bool selected_only;
     bool run_after_generate;
     bool stop_on_failure;
+    bool selected_evidence;
     ConfirmAction confirm_action;
     char *editor_lines[EDITOR_LINES];
     size_t editor_line_caps[EDITOR_LINES];
@@ -182,6 +184,7 @@ static const RegexTemplate REGEX_TEMPLATES[] = {
     {"alnum", "[[:alnum:]]+"},
     {"space", "[[:space:]]+"},
     {"word", "[[:alnum:]_]+"},
+    {"path", "(\\.{1,2}/|/)?[^[:space:]:]+"},
     {"any", ".*"},
     {"optional", "?"},
     {"repeat", "*"},
@@ -246,6 +249,7 @@ static const char *EDITOR_HELP_LINES[] = {
     "@restore <path>                 Restore a previously backed-up path.",
     "@reboot-if <condition>          Reboot only when condition is true.",
     "@capture <command>              Capture stdout/stderr/status variables.",
+    "@evidence-capture <command>     Capture and write prompted evidence.",
     "@evidence <command>             Record prompted command output in evidence.",
     "@evidence-comment <text>        Record an evidence comment line.",
     "",
@@ -1500,6 +1504,10 @@ static void write_command_expanded(FILE *f, const char *command) {
                 fputs("autotest_evidence_comment ", f);
                 shell_quote(f, directive_arg);
                 fputc('\n', f);
+            } else if (line_starts_directive(p, len, "@evidence-capture", directive_arg, sizeof(directive_arg))) {
+                fputs("autotest_evidence_capture ", f);
+                shell_quote(f, directive_arg);
+                fputc('\n', f);
             } else if (line_starts_directive(p, len, "@evidence", directive_arg, sizeof(directive_arg))) {
                 fputs("autotest_evidence ", f);
                 shell_quote(f, directive_arg);
@@ -1760,6 +1768,11 @@ static bool validate_custom_syntax(const char *command, SyntaxError *err) {
                 /* Evidence comments are written only when --evidence is used. */
             } else if (trimmed_has_directive(trimmed, "@evidence-comment")) {
                 set_syntax_error(err, line_no, "@evidence-comment requires text");
+                return false;
+            } else if (line_starts_directive(p, len, "@evidence-capture", directive_arg, sizeof(directive_arg))) {
+                /* Captured evidence commands are run once and checked later. */
+            } else if (trimmed_has_directive(trimmed, "@evidence-capture")) {
+                set_syntax_error(err, line_no, "@evidence-capture requires a command");
                 return false;
             } else if (line_starts_directive(p, len, "@evidence", directive_arg, sizeof(directive_arg))) {
                 /* Evidence commands are run only when --evidence is used. */
@@ -2542,6 +2555,36 @@ static void init_project(Project *p) {
     load_test_registry(p);
 }
 
+static int regenerate_registered_scripts(void) {
+    Project project;
+    memset(&project, 0, sizeof(project));
+    snprintf(project.name, sizeof(project.name), "autotest-assist");
+    if (!load_test_registry(&project)) {
+        printf("Regenerated 0 registered test scripts.\n");
+        return 0;
+    }
+    int failures = 0;
+    for (int i = 0; i < project.case_count; i++) {
+        TestCase *tc = &project.cases[i];
+        if (!tc->script_path[0]) continue;
+        int rc = write_single_test_script(tc);
+        if (rc == 0) {
+            printf("[OK] regenerated %s\n", tc->script_path);
+        } else {
+            printf("[NG] failed to regenerate %s\n", tc->script_path[0] ? tc->script_path : tc->title);
+            failures++;
+        }
+    }
+    if (failures == 0) save_test_registry(&project);
+    for (int i = 0; i < project.case_count; i++) free_test_case(&project.cases[i]);
+    if (failures != 0) {
+        printf("Regenerate failed: failures=%d\n", failures);
+        return 1;
+    }
+    printf("Regenerated %d registered test scripts.\n", project.case_count);
+    return 0;
+}
+
 static void init_app(App *app) {
     memset(app, 0, sizeof(*app));
     init_project(&app->project);
@@ -3123,6 +3166,25 @@ static bool selected_result_path(char *out, size_t out_sz) {
     return true;
 }
 
+static bool selected_evidence_dir_path(char *out, size_t out_sz) {
+    char cwd[LONG_LEN];
+    if (!getcwd(cwd, sizeof(cwd))) return false;
+    if (strlen(cwd) + strlen("/autotest_selected_evidence") + 1 > out_sz) return false;
+    snprintf(out, out_sz, "%s/autotest_selected_evidence", cwd);
+    return true;
+}
+
+static bool selected_evidence_file_path(const TestCase *tc, int index, char *out, size_t out_sz) {
+    char dir[LONG_LEN];
+    char filename[TEXT_LEN];
+    if (!selected_evidence_dir_path(dir, sizeof(dir))) return false;
+    make_test_filename(tc, filename, sizeof(filename));
+    char *dot = strrchr(filename, '.');
+    if (dot && strcmp(dot, ".sh") == 0) *dot = '\0';
+    int n = snprintf(out, out_sz, "%s/%03d_%s_%s.evidence", dir, index, tc->id, filename);
+    return n > 0 && n < (int)out_sz;
+}
+
 static void draw_result(const App *app, int height, int width) {
     draw_header(app, width);
     draw_box(3, 0, height - 7, width, "Selected Test Results");
@@ -3173,7 +3235,7 @@ static void draw_confirm(const App *app, int height, int width) {
         mvprintw(height - 9, 6, "Delete selected test?");
     } else {
         mvprintw(6, 6, "Selected test scripts may contain risky commands.");
-        if (app->run_after_generate) mvprintw(7, 8, "- choose Stop on NG before starting");
+        if (app->run_after_generate) mvprintw(7, 8, "- choose Stop on NG / Evidence before starting");
         if (has_reboot(&app->project)) mvprintw(8, 8, "- reboot");
         for (int i = 0; i < app->project.cleanup_count && i < 4; i++) {
             mvprintw(9 + i, 8, "- cleanup: %.*s", width - 22, app->project.cleanups[i]);
@@ -3182,9 +3244,11 @@ static void draw_confirm(const App *app, int height, int width) {
     }
     if (app->confirm_action == CONFIRM_GENERATE && app->run_after_generate) {
         char stop_label[32];
+        char evidence_label[32];
         snprintf(stop_label, sizeof(stop_label), "Stop on NG: %s", app->stop_on_failure ? "yes" : "no");
-        const char *menu[] = {"Start", stop_label, "Back"};
-        draw_menu(height - 7, 6, width - 12, menu, 3, app->selected_menu);
+        snprintf(evidence_label, sizeof(evidence_label), "Evidence: %s", app->selected_evidence ? "yes" : "no");
+        const char *menu[] = {"Start", stop_label, evidence_label, "Back"};
+        draw_menu(height - 7, 6, width - 12, menu, 4, app->selected_menu);
     } else {
         static const char *menu[] = {"Continue", "Back"};
         draw_menu(height - 7, 6, width - 12, menu, 2, app->selected_menu);
@@ -3585,8 +3649,9 @@ static void completion_add(App *app, const char *item, const char *prefix) {
 
 static bool editor_build_completion(App *app) {
     static const char *directives[] = {
-        "@check ", "@assert ", "@backup ", "@restore ", "@capture ", "@evidence ",
-        "@evidence-comment ", "@tui ", "@reboot-if "
+        "@check ", "@assert ", "@backup ", "@restore ", "@capture ",
+        "@evidence ", "@evidence-capture ", "@evidence-comment ", "@tui ",
+        "@reboot-if "
     };
     static const char *tui_commands[] = {
         "send ", "text ", "enter", "esc", "tab", "space", "sleep ", "ctrl ",
@@ -5030,9 +5095,12 @@ static void write_match_function(FILE *f) {
     fputs("  printf '# RESUME %s\\n' \"$(date '+%Y-%m-%d %H:%M:%S')\" >>\"$EVIDENCE_FILE\"\n", f);
     fputs("}\n\n", f);
     fputs("autotest_evidence() {\n", f);
-    fputs("  [ -n \"${EVIDENCE_FILE:-}\" ] || return 0\n", f);
     fputs("  local cmd=\"$1\"\n", f);
-    fputs("  { autotest_evidence_prompt; printf '%s\\n' \"$cmd\"; ( set +u; eval \"$cmd\" ); } >>\"$EVIDENCE_FILE\" 2>&1\n", f);
+    fputs("  if [ -n \"${EVIDENCE_FILE:-}\" ]; then\n", f);
+    fputs("    { autotest_evidence_prompt; printf '%s\\n' \"$cmd\"; ( set +u; eval \"$cmd\" ); } >>\"$EVIDENCE_FILE\" 2>&1\n", f);
+    fputs("  else\n", f);
+    fputs("    ( set +u; eval \"$cmd\" ) >/dev/null 2>&1\n", f);
+    fputs("  fi\n", f);
     fputs("  return 0\n", f);
     fputs("}\n\n", f);
     fputs("autotest_capture() {\n", f);
@@ -5047,6 +5115,22 @@ static void write_match_function(FILE *f) {
     fputs("  AUTOTEST_STDOUT=\"$(cat \"$AUTOTEST_STDOUT_FILE\" 2>/dev/null || true)\"\n", f);
     fputs("  AUTOTEST_STDERR=\"$(cat \"$AUTOTEST_STDERR_FILE\" 2>/dev/null || true)\"\n", f);
     fputs("  export AUTOTEST_CAPTURE_INDEX AUTOTEST_CAPTURE_DIR AUTOTEST_STATUS AUTOTEST_STDOUT AUTOTEST_STDERR AUTOTEST_STDOUT_FILE AUTOTEST_STDERR_FILE\n", f);
+    fputs("  return 0\n", f);
+    fputs("}\n\n", f);
+    fputs("autotest_evidence_capture() {\n", f);
+    fputs("  local cmd=\"$1\"\n", f);
+    fputs("  AUTOTEST_CAPTURE_INDEX=$(( ${AUTOTEST_CAPTURE_INDEX:-0} + 1 ))\n", f);
+    fputs("  AUTOTEST_CAPTURE_DIR=\"${AUTOTEST_CAPTURE_DIR:-${WORK_DIR:-/tmp}/autotest-capture}\"\n", f);
+    fputs("  mkdir -p \"$AUTOTEST_CAPTURE_DIR\"\n", f);
+    fputs("  AUTOTEST_STDOUT_FILE=\"$AUTOTEST_CAPTURE_DIR/capture_${AUTOTEST_CAPTURE_INDEX}.stdout\"\n", f);
+    fputs("  AUTOTEST_STDERR_FILE=\"$AUTOTEST_CAPTURE_DIR/capture_${AUTOTEST_CAPTURE_INDEX}.stderr\"\n", f);
+    fputs("  if [ -n \"${EVIDENCE_FILE:-}\" ]; then { autotest_evidence_prompt; printf '%s\\n' \"$cmd\"; } >>\"$EVIDENCE_FILE\"; fi\n", f);
+    fputs("  ( set +u; eval \"$cmd\" ) >\"$AUTOTEST_STDOUT_FILE\" 2>\"$AUTOTEST_STDERR_FILE\"\n", f);
+    fputs("  AUTOTEST_STATUS=\"$?\"\n", f);
+    fputs("  AUTOTEST_STDOUT=\"$(cat \"$AUTOTEST_STDOUT_FILE\" 2>/dev/null || true)\"\n", f);
+    fputs("  AUTOTEST_STDERR=\"$(cat \"$AUTOTEST_STDERR_FILE\" 2>/dev/null || true)\"\n", f);
+    fputs("  export AUTOTEST_CAPTURE_INDEX AUTOTEST_CAPTURE_DIR AUTOTEST_STATUS AUTOTEST_STDOUT AUTOTEST_STDERR AUTOTEST_STDOUT_FILE AUTOTEST_STDERR_FILE\n", f);
+    fputs("  if [ -n \"${EVIDENCE_FILE:-}\" ]; then [ -f \"$AUTOTEST_STDOUT_FILE\" ] && cat \"$AUTOTEST_STDOUT_FILE\" >>\"$EVIDENCE_FILE\"; [ -f \"$AUTOTEST_STDERR_FILE\" ] && cat \"$AUTOTEST_STDERR_FILE\" >>\"$EVIDENCE_FILE\"; printf '\\n# exit status: %s\\n' \"$AUTOTEST_STATUS\" >>\"$EVIDENCE_FILE\"; fi\n", f);
     fputs("  return 0\n", f);
     fputs("}\n\n", f);
     fputs("autotest_backup_key() { printf '%s' \"$1\" | cksum | awk '{print $1}'; }\n\n", f);
@@ -5522,12 +5606,14 @@ static int write_resume_automation(App *app, char *runner_path, size_t runner_sz
     char resume_path[LONG_LEN];
     char unit_path[LONG_LEN];
     char result_path[LONG_LEN];
+    char evidence_dir[LONG_LEN] = "";
     int reboot_idx = first_selected_reboot_index(app);
     if (reboot_idx < 0) return -1;
     if (ensure_selected_test_scripts(app) != 0) return -1;
     if (!getcwd(cwd, sizeof(cwd))) return -1;
     if (strlen(cwd) + 64 >= LONG_LEN) return -1;
     if (strchr(cwd, ' ') != NULL) return -1;
+    if (app->selected_evidence && !selected_evidence_dir_path(evidence_dir, sizeof(evidence_dir))) return -1;
     snprintf(runner_path, runner_sz, "%s/autotest_selected_runner.sh", cwd);
     snprintf(resume_path, sizeof(resume_path), "%s/autotest_selected_resume.sh", cwd);
     snprintf(unit_path, sizeof(unit_path), "%s/autotest-selected-resume.service", cwd);
@@ -5546,6 +5632,10 @@ static int write_resume_automation(App *app, char *runner_path, size_t runner_sz
     shell_quote_str(f, result_path);
     fprintf(f, "\n");
     fprintf(f, "STOP_ON_FAILURE=%d\n", app->stop_on_failure ? 1 : 0);
+    fprintf(f, "EVIDENCE_ENABLED=%d\n", app->selected_evidence ? 1 : 0);
+    fprintf(f, "EVIDENCE_DIR=");
+    shell_quote_str(f, evidence_dir);
+    fprintf(f, "\n");
     fprintf(f, "ids=(");
     for (int i = 0; i < app->project.case_count; i++) {
         TestCase *tc = &app->project.cases[i];
@@ -5581,8 +5671,32 @@ static int write_resume_automation(App *app, char *runner_path, size_t runner_sz
         fprintf(f, " ");
     }
     fprintf(f, ")\n");
+    fprintf(f, "evidence_paths=(");
+    int evidence_index = 1;
+    for (int i = 0; i < app->project.case_count; i++) {
+        TestCase *tc = &app->project.cases[i];
+        char evidence_path[LONG_LEN] = "";
+        if (!tc->selected) continue;
+        if (app->selected_evidence &&
+            !selected_evidence_file_path(tc, evidence_index, evidence_path, sizeof(evidence_path))) {
+            fclose(f);
+            return -1;
+        }
+        shell_quote_str(f, evidence_path);
+        fprintf(f, " ");
+        evidence_index++;
+    }
+    fprintf(f, ")\n");
     fprintf(f, "count=${#paths[@]}\n");
-    fprintf(f, "log() { echo \"$*\" | tee -a \"$SUMMARY_PATH\"; }\n");
+    fprintf(f, "print_status_colored() {\n");
+    fprintf(f, "  msg=\"$*\"\n");
+    fprintf(f, "  case \"$msg\" in\n");
+    fprintf(f, "    '[OK]'*) if [ -t 1 ]; then printf '\\033[32m[OK]\\033[0m%%s\\n' \"${msg#'[OK]'}\"; else printf '%%s\\n' \"$msg\"; fi ;;\n");
+    fprintf(f, "    '[NG]'*) if [ -t 1 ]; then printf '\\033[31m[NG]\\033[0m%%s\\n' \"${msg#'[NG]'}\"; else printf '%%s\\n' \"$msg\"; fi ;;\n");
+    fprintf(f, "    *) printf '%%s\\n' \"$msg\" ;;\n");
+    fprintf(f, "  esac\n");
+    fprintf(f, "}\n");
+    fprintf(f, "log() { print_status_colored \"$*\"; printf '%%s\\n' \"$*\" >>\"$SUMMARY_PATH\"; }\n");
     fprintf(f, "read_num() { if [ -f \"$1\" ]; then cat \"$1\"; else echo 0; fi; }\n");
     fprintf(f, "write_failures() { echo \"$1\" >\"$FAIL_FILE\"; }\n");
     fprintf(f, "cleanup_selected_runner() {\n");
@@ -5624,8 +5738,11 @@ static int write_resume_automation(App *app, char *runner_path, size_t runner_sz
     fprintf(f, "  rm -f \"$WAIT_SAFE_FILE\" \"$WAIT_RESULT_FILE\"\n");
     fprintf(f, "}\n");
     fprintf(f, "mkdir -p \"$STATE_DIR\"\n");
+    fprintf(f, "if [ \"$EVIDENCE_ENABLED\" = 1 ]; then mkdir -p \"$EVIDENCE_DIR\"; fi\n");
     fprintf(f, "touch \"$SUMMARY_PATH\"\n");
     fprintf(f, "log \"stop_on_ng=$([ \"$STOP_ON_FAILURE\" = 1 ] && echo yes || echo no)\"\n");
+    fprintf(f, "log \"evidence=$([ \"$EVIDENCE_ENABLED\" = 1 ] && echo yes || echo no)\"\n");
+    fprintf(f, "if [ \"$EVIDENCE_ENABLED\" = 1 ]; then log \"evidence_dir=$EVIDENCE_DIR\"; fi\n");
     fprintf(f, "check_waiting_reboot\n");
     fprintf(f, "stop_after_failure_if_needed\n");
     fprintf(f, "idx=$(read_num \"$INDEX_FILE\")\n");
@@ -5635,13 +5752,15 @@ static int write_resume_automation(App *app, char *runner_path, size_t runner_sz
     fprintf(f, "  path=${paths[$idx]}\n");
     fprintf(f, "  kind=${kinds[$idx]}\n");
     fprintf(f, "  safe_id=${safe_ids[$idx]}\n");
+    fprintf(f, "  evidence_file=${evidence_paths[$idx]}\n");
     fprintf(f, "  result_file=\"${path%%.sh}.result\"\n");
     fprintf(f, "  log \"[$((idx + 1))/$count] $id $path\"\n");
+    fprintf(f, "  if [ \"$EVIDENCE_ENABLED\" = 1 ]; then log \"evidence: $evidence_file\"; fi\n");
     fprintf(f, "  if [ \"$kind\" = \"reboot\" ]; then\n");
     fprintf(f, "    echo $((idx + 1)) >\"$INDEX_FILE\"\n");
     fprintf(f, "    echo \"$safe_id\" >\"$WAIT_SAFE_FILE\"\n");
     fprintf(f, "    echo \"$result_file\" >\"$WAIT_RESULT_FILE\"\n");
-    fprintf(f, "    bash \"$path\"\n");
+    fprintf(f, "    if [ \"$EVIDENCE_ENABLED\" = 1 ]; then bash \"$path\" --evidence \"$evidence_file\"; else bash \"$path\"; fi\n");
     fprintf(f, "    rc=$?\n");
     fprintf(f, "    if [ \"$rc\" -ne 0 ]; then\n");
     fprintf(f, "      log \"[NG] $id failed before reboot rc=$rc\"\n");
@@ -5665,7 +5784,7 @@ static int write_resume_automation(App *app, char *runner_path, size_t runner_sz
     fprintf(f, "    write_failures \"$failures\"\n");
     fprintf(f, "    stop_after_failure_if_needed\n");
     fprintf(f, "  else\n");
-    fprintf(f, "    bash \"$path\"\n");
+    fprintf(f, "    if [ \"$EVIDENCE_ENABLED\" = 1 ]; then bash \"$path\" --evidence \"$evidence_file\"; else bash \"$path\"; fi\n");
     fprintf(f, "    rc=$?\n");
     fprintf(f, "    if [ \"$rc\" -ne 0 ]; then failures=$((failures + 1)); write_failures \"$failures\"; fi\n");
     fprintf(f, "    if [ -f \"$result_file\" ]; then cat \"$result_file\" >>\"$SUMMARY_PATH\"; echo >>\"$SUMMARY_PATH\"; rm -f \"$result_file\"; fi\n");
@@ -5720,6 +5839,24 @@ static int system_exit_code(int rc) {
     return 127;
 }
 
+static void print_status_colored_line(const char *line) {
+    if (!line) return;
+    const char *tag = NULL;
+    const char *color = NULL;
+    if (strncmp(line, "[OK]", 4) == 0) {
+        tag = "[OK]";
+        color = "32";
+    } else if (strncmp(line, "[NG]", 4) == 0) {
+        tag = "[NG]";
+        color = "31";
+    }
+    if (tag && isatty(STDOUT_FILENO)) {
+        printf("\033[%sm%s\033[0m%s", color, tag, line + 4);
+    } else {
+        fputs(line, stdout);
+    }
+}
+
 static void append_file_to_stream(FILE *out, const char *path) {
     FILE *in = fopen(path, "r");
     if (!in) return;
@@ -5727,6 +5864,16 @@ static void append_file_to_stream(FILE *out, const char *path) {
     size_t n;
     while ((n = fread(buf, 1, sizeof(buf), in)) > 0) {
         fwrite(buf, 1, n, out);
+    }
+    fclose(in);
+}
+
+static void append_file_to_stdout_colored(const char *path) {
+    FILE *in = fopen(path, "r");
+    if (!in) return;
+    char line[LONG_LEN];
+    while (fgets(line, sizeof(line), in)) {
+        print_status_colored_line(line);
     }
     fclose(in);
 }
@@ -5745,7 +5892,7 @@ static void start_selected_test_scripts(App *app) {
             int rc = system(quoted);
             printf("\nRunner finished with status %d. If reboot happened, remaining tests will continue after boot.\n", rc);
         } else {
-            printf("[NG] failed to create reboot resume automation\n");
+            print_status_colored_line("[NG] failed to create reboot resume automation\n");
         }
         printf("Press Enter to return to TUI.");
         fflush(stdout);
@@ -5755,18 +5902,36 @@ static void start_selected_test_scripts(App *app) {
         return;
     }
     char selected_result[LONG_LEN];
+    char evidence_dir[LONG_LEN] = "";
     char output_path[LONG_LEN];
     FILE *result = NULL;
     int total = 0;
     int ok_count = 0;
     int ng_count = 0;
+    if (app->selected_evidence) {
+        struct stat st;
+        if (!selected_evidence_dir_path(evidence_dir, sizeof(evidence_dir)) ||
+            (mkdir(evidence_dir, 0755) != 0 &&
+             (errno != EEXIST || stat(evidence_dir, &st) != 0 || !S_ISDIR(st.st_mode)))) {
+            print_status_colored_line("[NG] failed to prepare selected evidence directory\n");
+            printf("Press Enter to return to TUI.");
+            fflush(stdout);
+            (void)getchar();
+            reset_prog_mode();
+            refresh();
+            return;
+        }
+    }
     if (selected_result_path(selected_result, sizeof(selected_result))) {
         result = fopen(selected_result, "w");
     }
     if (result) {
         fprintf(result, "AutoTest selected result\n");
         fprintf(result, "cwd=%s\n\n", getcwd(output_path, sizeof(output_path)) ? output_path : ".");
-        fprintf(result, "stop_on_ng=%s\n\n", app->stop_on_failure ? "yes" : "no");
+        fprintf(result, "stop_on_ng=%s\n", app->stop_on_failure ? "yes" : "no");
+        fprintf(result, "evidence=%s\n", app->selected_evidence ? "yes" : "no");
+        if (app->selected_evidence) fprintf(result, "evidence_dir=%s\n", evidence_dir);
+        fprintf(result, "\n");
     }
     int index = 1;
     for (int i = 0; i < app->project.case_count; i++) {
@@ -5775,7 +5940,9 @@ static void start_selected_test_scripts(App *app) {
         total++;
         if (!tc->script_path[0]) {
             if (write_single_test_script(tc) != 0) {
-                printf("[NG] %s %s failed to create test script\n", tc->id, tc->title);
+                char msg[TEXT_LEN * 2];
+                snprintf(msg, sizeof(msg), "[NG] %s %s failed to create test script\n", tc->id, tc->title);
+                print_status_colored_line(msg);
                 if (result) fprintf(result, "[NG] %s %s failed to create test script\n\n", tc->id, tc->title);
                 ng_count++;
                 if (app->stop_on_failure) {
@@ -5787,25 +5954,48 @@ static void start_selected_test_scripts(App *app) {
             }
         }
         char quoted[LONG_LEN + 16];
+        char evidence_quoted[LONG_LEN + 16];
         char output_quoted[LONG_LEN + 16];
-        char cmd[LONG_LEN * 2 + 64];
+        char cmd[LONG_LEN * 3 + 96];
         char result_path[LONG_LEN];
+        char evidence_path[LONG_LEN] = "";
+        int display_index = index;
         shell_quote_buf(quoted, sizeof(quoted), tc->script_path);
         make_result_path(tc->script_path, result_path, sizeof(result_path));
         unlink(result_path);
+        if (app->selected_evidence) {
+            if (!selected_evidence_file_path(tc, display_index, evidence_path, sizeof(evidence_path))) {
+                char msg[TEXT_LEN * 2];
+                snprintf(msg, sizeof(msg), "[NG] %s %s failed to resolve evidence path\n", tc->id, tc->title);
+                print_status_colored_line(msg);
+                if (result) fprintf(result, "[NG] %s %s failed to resolve evidence path\n\n", tc->id, tc->title);
+                ng_count++;
+                if (app->stop_on_failure) break;
+                continue;
+            }
+            unlink(evidence_path);
+            shell_quote_buf(evidence_quoted, sizeof(evidence_quoted), evidence_path);
+        }
         const char *tmpdir = getenv("TMPDIR");
         if (!tmpdir || !tmpdir[0]) tmpdir = "/tmp";
-        snprintf(output_path, sizeof(output_path), "%s/autotest-selected-output.%d.%d", tmpdir, (int)getpid(), index);
+        snprintf(output_path, sizeof(output_path), "%s/autotest-selected-output.%d.%d", tmpdir, (int)getpid(), display_index);
         shell_quote_buf(output_quoted, sizeof(output_quoted), output_path);
-        snprintf(cmd, sizeof(cmd), "%s >%s 2>&1", quoted, output_quoted);
-        printf("[%02d] %s %s\n%s\n", index++, tc->id, tc->title, tc->script_path);
+        if (app->selected_evidence) {
+            snprintf(cmd, sizeof(cmd), "%s --evidence %s >%s 2>&1", quoted, evidence_quoted, output_quoted);
+        } else {
+            snprintf(cmd, sizeof(cmd), "%s >%s 2>&1", quoted, output_quoted);
+        }
+        printf("[%02d] %s %s\n%s\n", display_index, tc->id, tc->title, tc->script_path);
+        if (app->selected_evidence) printf("evidence: %s\n", evidence_path);
+        index++;
         int rc = system(cmd);
         int exit_code = system_exit_code(rc);
-        append_file_to_stream(stdout, output_path);
+        append_file_to_stdout_colored(output_path);
         printf("exit=%d\n\n", exit_code);
         if (result) {
-            fprintf(result, "[%02d] %s %s\n", index - 1, tc->id, tc->title);
+            fprintf(result, "[%02d] %s %s\n", display_index, tc->id, tc->title);
             fprintf(result, "script=%s\n", tc->script_path);
+            if (app->selected_evidence) fprintf(result, "evidence=%s\n", evidence_path);
             fprintf(result, "exit=%d\n", exit_code);
             append_file_to_stream(result, output_path);
             fprintf(result, "\n");
@@ -5835,7 +6025,7 @@ static void start_selected_test_scripts(App *app) {
         fclose(result);
         printf("Selected result: %s\n", selected_result);
     } else {
-        printf("[NG] failed to write selected result file\n");
+        print_status_colored_line("[NG] failed to write selected result file\n");
     }
     printf("Automated test sequence finished. Press Enter to return to TUI.");
     fflush(stdout);
@@ -5985,6 +6175,9 @@ static void run_selected_menu(App *app) {
             } else if (app->selected_menu == 1) {
                 app->stop_on_failure = !app->stop_on_failure;
                 set_status(app, app->stop_on_failure ? "Stop on NG enabled." : "Stop on NG disabled.");
+            } else if (app->selected_menu == 2) {
+                app->selected_evidence = !app->selected_evidence;
+                set_status(app, app->selected_evidence ? "Evidence enabled." : "Evidence disabled.");
             } else {
                 app->screen = app->previous_screen;
                 app->selected_menu = 0;
@@ -6019,7 +6212,7 @@ static int menu_count_for(Screen s) {
     case SCREEN_SCRIPT_EDITOR: return 1;
     case SCREEN_PREVIEW: return 6;
     case SCREEN_RESULT: return 2;
-    case SCREEN_CONFIRM: return 3;
+    case SCREEN_CONFIRM: return 4;
     }
     return 1;
 }
@@ -6081,7 +6274,15 @@ static void handle_key(App *app, int ch) {
     clamp_selected(app);
 }
 
-int main(void) {
+int main(int argc, char **argv) {
+    if (argc > 1) {
+        if (argc == 2 && strcmp(argv[1], "--regen-scripts") == 0) {
+            return regenerate_registered_scripts();
+        }
+        fprintf(stderr, "Usage: %s [--regen-scripts]\n", argv[0]);
+        return 2;
+    }
+
     App app;
     setlocale(LC_ALL, "");
     init_app(&app);

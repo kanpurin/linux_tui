@@ -48,6 +48,7 @@ state=$(systemctl is-active ssh)
 | `@restore` | Restore a previously backed-up path | `@restore /path` |
 | `@reboot-if` | Reboot only when a shell condition is true | `@reboot-if condition` |
 | `@evidence` | Write a prompted command and its output to evidence | `@evidence command` |
+| `@evidence-capture` | Write evidence and capture stdout, stderr, and status | `@evidence-capture command` |
 | `@evidence-comment` | Write a comment line to evidence | `@evidence-comment text` |
 
 Directives are line-oriented. `@capture` is a one-line command directive. For
@@ -127,6 +128,21 @@ done
 
 `AUTOTEST_STDOUT`, `AUTOTEST_STDERR`, and `AUTOTEST_STATUS` always contain the
 most recent `@capture` result.
+
+Use `@evidence-capture <command>` when the command under test should both appear
+in the evidence log and update the same variables as `@capture`:
+
+```sh
+@evidence-comment run test.sh
+@evidence-capture ./test.sh /etc/conf
+@check AUTOTEST_STATUS exact 0
+```
+
+`@evidence-capture` runs the command once. It always updates
+`AUTOTEST_STDOUT`, `AUTOTEST_STDERR`, `AUTOTEST_STATUS`,
+`AUTOTEST_STDOUT_FILE`, and `AUTOTEST_STDERR_FILE`. When `--evidence` is used,
+it also writes the prompt, command, stdout, stderr, and `# exit status: N` to
+the evidence log.
 
 ## TUI Automation
 
@@ -276,8 +292,54 @@ Only explicit evidence directives write to the evidence file:
 @evidence systemctl status ssh --no-pager
 ```
 
-`@evidence` commands are skipped unless `--evidence` is specified. Their exit
-status does not affect the test result.
+`@evidence` commands always run. When `--evidence` is not specified, their
+stdout and stderr are discarded. When `--evidence` is specified, they write the
+prompt, command, stdout, and stderr to the evidence file. Their exit status does
+not affect the test result.
+
+### Evidence Style
+
+When a test prepares files, directories, or configuration, prefer running the
+preparation commands with `@evidence` so the evidence log shows the test
+precondition.
+
+Use `@evidence-comment` as a short section label. Do not duplicate the command
+itself in the comment; the command line is already written by `@evidence` or
+`@evidence-capture`.
+
+| Directive | Runs command | Writes evidence | Updates `AUTOTEST_*` |
+|---|---:|---:|---:|
+| `@evidence` | yes | yes, when `--evidence` is used | no |
+| `@capture` | yes | no | yes |
+| `@evidence-capture` | yes | yes, when `--evidence` is used | yes |
+
+Default style for tests that modify a path:
+
+1. Back up the path with `@backup`.
+2. Prepare the file or configuration with `@evidence`.
+3. Record prepared state with `@evidence`.
+4. Run the command under test with `@evidence-capture` when its result should be
+   checked and logged.
+5. Check `AUTOTEST_STATUS`, `AUTOTEST_STDOUT`, or `AUTOTEST_STDERR`.
+6. Restore the path with `@restore`.
+
+Example:
+
+```sh
+@backup /etc/conf
+
+@evidence-comment prepare /etc/conf
+@evidence rm -f /etc/conf
+@evidence echo 1 > /etc/conf
+@evidence ls -l /etc/conf
+@evidence cat /etc/conf
+
+@evidence-comment run test.sh
+@evidence-capture ./test.sh /etc/conf
+@check AUTOTEST_STATUS exact 0
+
+@restore /etc/conf
+```
 
 ## Generated Script Options
 
